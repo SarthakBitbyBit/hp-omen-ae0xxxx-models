@@ -3072,7 +3072,19 @@ static int hp_wmi_lightbar_get_colors(u8 colors[HP_LIGHTBAR_NUM_ZONES][HP_LIGHTB
 static bool hp_wmi_lightbar_is_supported(void)
 {
 	u8 buf[HP_LIGHTBAR_BUFFER_SIZE];
+	u8 keyboard_type;
 	int ret;
+
+	/*
+	 * Chassis lightbars are only present on select models equipped with
+	 * per-key RGB keyboards (where the keyboard backlight is handled via USB HID).
+	 * Single-zone and 4-zone models use WMI backlight for keyboard and do not
+	 * possess a physical lightbar.
+	 */
+	ret = hp_wmi_perform_query(HPWMI_GET_KEYBOARD_TYPE_QUERY, HPWMI_GM, &keyboard_type, sizeof(keyboard_type),
+				   sizeof(keyboard_type));
+	if (ret || keyboard_type != HP_KEYBOARD_TYPE_RGB_PER_KEY)
+		return false;
 
 	memset(buf, 0, sizeof(buf));
 	buf[0] = 0;
