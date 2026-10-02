@@ -1,6 +1,7 @@
 import sys
 import os
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+import time
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QFrame, QStackedWidget,
                             QComboBox, QSpinBox, QMessageBox, QFileDialog,
                             QProgressBar, QListView, QTextEdit,
@@ -53,7 +54,7 @@ class MainWindow(QMainWindow):
         self.back_btn.setVisible(False)
         left_layout.addWidget(self.back_btn)
         
-        self.rpm_label = QLabel("0 RPM")
+        self.rpm_label = QLabel("N/A")
         self.rpm_label.setObjectName("HeaderRPM")
         self.rpm_label.setFixedWidth(120)
         self.rpm_label.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -114,6 +115,7 @@ class MainWindow(QMainWindow):
         
         self._manual_cleaning_initiated = False
         self._cleaner_alerted_status_ts = 0.0
+        self._last_fan_reprobe_time = time.time()
 
         # Initialize cleaner page if system/board supports Fan Cleaner
         if self.controller.check_fan_cleaner_capability():
@@ -1335,7 +1337,24 @@ class MainWindow(QMainWindow):
 
     def show_fan_control(self):
         self.update_fan_target_toggle_visibility()
+        self._update_fan_control_ui_availability()
         self.show_page(self.fan_page, "Fan Control")
+
+    def _update_fan_control_ui_availability(self):
+        """Enable or disable fan-control widgets depending on hwmon availability."""
+        available = self.controller.fan_control_available
+        self.mode_combo.setEnabled(available)
+        self.set_btn.setEnabled(available)
+        if hasattr(self, "manual_widget"):
+            self.manual_widget.setEnabled(available)
+        if hasattr(self, "curve_editor_container"):
+            self.curve_editor_container.setEnabled(available)
+        if hasattr(self, "cal_btn") and not getattr(self, "cal_running", False):
+            self.cal_btn.setEnabled(available)
+        if hasattr(self, "manual_clean_btn") and not getattr(self, "_manual_cleaning_initiated", False):
+            self.manual_clean_btn.setEnabled(available)
+        if hasattr(self, "auto_cleaner_check"):
+            self.auto_cleaner_check.setEnabled(available)
 
     def show_calibration(self): self.show_page(self.stack.widget(2), "Calibration")
     def show_driver(self): self.show_page(self.stack.widget(3), "Driver Management")
@@ -1359,21 +1378,36 @@ class MainWindow(QMainWindow):
         else:
              temp = self.controller.get_reference_temp()
 
-        rpm_str = f"-{rpm} RPM" if (in_reverse and rpm > 0) else f"{rpm} RPM"
-        self.rpm_label.setText(rpm_str)
+        active_fan = self.controller.get_active_fan_index() if hasattr(self.controller, "get_active_fan_index") else None
+        if active_fan is not None and hasattr(self.controller, "is_fan_telemetry_available"):
+            telem_avail = self.controller.is_fan_telemetry_available(active_fan)
+        elif hasattr(self.controller, "is_fan_telemetry_available"):
+            telem_avail = False
+        else:
+            telem_avail = getattr(self.controller, "fan_telemetry_available", False)
+            if callable(telem_avail):
+                telem_avail = telem_avail()
+
+        if not telem_avail:
+            self.rpm_label.setText("N/A")
+        elif in_reverse and rpm > 0:
+            self.rpm_label.setText(f"-{rpm} RPM")
+        else:
+            self.rpm_label.setText(f"{rpm} RPM")
         self.temp_label.setText(f"{temp}°C")
-        
+
         sensor = self.controller.config.get("reference_sensor", "cpu")
         self.cpu_pill_btn.setProperty("active", sensor == "cpu")
         self.gpu_pill_btn.setProperty("active", sensor == "gpu")
-        
+
         # Refresh styling for property changes
         self.cpu_pill_btn.style().unpolish(self.cpu_pill_btn)
         self.cpu_pill_btn.style().polish(self.cpu_pill_btn)
         self.gpu_pill_btn.style().unpolish(self.gpu_pill_btn)
         self.gpu_pill_btn.style().polish(self.gpu_pill_btn)
-        
+
         self.check_driver_status()
+        self._update_fan_control_ui_availability()
         self.update_cleaner_status()
 
     def check_driver_status(self):
@@ -1382,20 +1416,53 @@ class MainWindow(QMainWindow):
         if any(x in current_text for x in ["Installing", "Restoring", "Calibrating", "Stress"]):
             return
 
-        # Refresh paths if driver might have just been loaded
-        if not self.controller.pwm1_path or not self.controller.pwm1_path.exists():
-            self.controller._find_paths()
-            
-        if self.controller.pwm1_path and self.controller.pwm1_path.exists():
-            if "Needs Driver Installation" in self.status_label.text() or "Checking..." in self.status_label.text():
-                 self.status_label.setText("Ready")
-                 self.status_label.setStyleSheet("color: #888; padding: 5px;")
+        # Re-probe sysfs paths periodically (every 30s) when unavailable, avoiding globs every second
+        _GUI_REPROBE_INTERVAL = 30.0
+        now = time.time()
+        if not self.controller.fan_control_available:
+            if now - getattr(self, "_last_fan_reprobe_time", 0.0) >= _GUI_REPROBE_INTERVAL:
+                self.controller._find_paths()
+                self._last_fan_reprobe_time = now
+
+        if self.controller.fan_control_available:
+            self._last_fan_reprobe_time = 0.0
+            if hasattr(self, "_update_fan_control_ui_availability"):
+                self._update_fan_control_ui_availability()
+            if "Fan control unavailable" in current_text or "Needs Driver" in current_text or "Checking..." in current_text:
+                self.status_label.setText("Ready")
+                self.status_label.setStyleSheet("color: #888; padding: 5px;")
         else:
-            self.status_label.setText("Needs Driver Installation")
-            self.status_label.setStyleSheet("color: #d63333; font-weight: bold; padding: 5px;")
+            if hasattr(self, "_update_fan_control_ui_availability"):
+                self._update_fan_control_ui_availability()
+            # Distinguish: board is in SUPPORTED_BOARDS but hwmon absent (protocol unvalidated)
+            # vs incomplete interface vs driver genuinely not installed on a board that expects it.
+            support_status, board_name = self.controller.check_board_support()
+            interface_state = self.controller.get_interface_state()
+            if support_status == "SUPPORTED" and board_name:
+                msg = (
+                    f"Fan control unavailable — interface not detected on board {board_name} "
+                    "(protocol pending validation); temperature monitoring remains available."
+                )
+            elif interface_state == "incomplete":
+                msg = (
+                    "Fan control unavailable — interface incomplete (missing required controls); "
+                    "temperature monitoring remains available."
+                )
+            else:
+                msg = (
+                    "Fan control unavailable — interface not detected; "
+                    "check driver installation. Temperature monitoring remains available."
+                )
+            _DRIVER_STATUSES = {"Fan control unavailable", "Needs Driver"}
+            if not any(s in current_text for s in _DRIVER_STATUSES):
+                self.status_label.setText(msg)
+                self.status_label.setStyleSheet("color: #e6a817; font-weight: bold; padding: 5px;")
 
     def on_status_click(self, event):
-        if "Needs Driver Installation" in self.status_label.text():
+        text = self.status_label.text()
+        if "protocol pending validation" in text or "interface incomplete" in text:
+            return
+        if "Fan control unavailable" in text or "Needs Driver" in text:
             self.show_driver()
         
     def on_mode_change(self, text):
@@ -1456,15 +1523,23 @@ class MainWindow(QMainWindow):
 
     def apply_fan_mode(self):
         mode = self.mode_combo.currentText().lower()
-        
+
+        # Guard: no writes when the fan-control interface is absent
+        if not self.controller.fan_control_available:
+            self.status_label.setText(
+                "Fan control unavailable — interface not detected; temperature monitoring remains available."
+            )
+            self.status_label.setStyleSheet("color: #e6a817; font-weight: bold; padding: 5px;")
+            return
+
         # Check driver requirement for Manual/Curve
         if mode in ["manual", "curve"]:
             has_driver = False
             if self.controller.pwm1_path and self.controller.pwm1_path.exists():
                 has_driver = True
-            
+
             if not has_driver:
-                QMessageBox.warning(self, "Driver Required", 
+                QMessageBox.warning(self, "Driver Required",
                     f"To use {mode.title()} mode, you must install the kernel driver patch.\n"
                     "Go to 'Driver Management' to install it.")
                 return
@@ -1533,6 +1608,8 @@ class MainWindow(QMainWindow):
             self.curve_timer.stop()
 
     def apply_curve_step(self):
+        if not self.controller.fan_control_available:
+            return  # no interface; temperature polling continues via rpm_timer but no writes here
         raw_temp = self.controller.get_cpu_temp()
         
         self.temp_history.append(raw_temp)
@@ -1556,7 +1633,7 @@ class MainWindow(QMainWindow):
         current_rpm = self.controller.get_fan_speed()
         max_rpm = self.controller.get_effective_fan_max()
         
-        if max_rpm > 0:
+        if max_rpm > 0 and self.controller.fan_telemetry_available:
             target_rpm = (target_cpu_pwm / 255) * max_rpm
             diff = abs(target_rpm - current_rpm)
             
@@ -1585,6 +1662,13 @@ class MainWindow(QMainWindow):
             self.start_calibration()
 
     def start_calibration(self):
+        if not self.controller.fan_control_available:
+            self.status_label.setText(
+                "Fan calibration unavailable — interface not detected; temperature monitoring remains available."
+            )
+            self.status_label.setStyleSheet("color: #e6a817; font-weight: bold; padding: 5px;")
+            return
+
         if hasattr(self, 'curve_timer'):
             self.curve_timer.stop()
         
@@ -2261,6 +2345,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Watchdog disabled")
 
     def run_watchdog(self):
+        if not self.controller.fan_control_available:
+            return  # no interface present; nothing to re-apply, don't claim success
         self.apply_fan_mode()
         self.status_label.setText("Watchdog: Mode re-applied")
 
@@ -2629,6 +2715,10 @@ class MainWindow(QMainWindow):
             self.cleaner_duration_source_lbl.setStyleSheet("color: #888888; font-size: 11px; font-weight: bold; margin-left: 24px;")
 
     def start_manual_cleaning(self):
+        if not self.controller.fan_control_available:
+            self._on_manual_start_failed("Fan control interface is not available.")
+            return
+
         import threading
         self._manual_cleaning_initiated = True
         if hasattr(self, "manual_clean_btn"):

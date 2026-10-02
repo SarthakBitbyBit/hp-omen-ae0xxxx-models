@@ -9,6 +9,10 @@ from . import get_controller
 def calibrate() -> None:
     """Run fan calibration to determine max RPM."""
     controller = get_controller()
+    if not controller.fan_control_available:
+        click.echo("Error: Fan control interface is not available.")
+        return
+
     if click.confirm("This will spin fans at max speed for calibration. Continue?"):
         prev_mode = controller.config.get("mode", "auto")
         controller.config["mode"] = "calibration"

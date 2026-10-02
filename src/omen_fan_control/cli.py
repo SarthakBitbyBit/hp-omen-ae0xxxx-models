@@ -337,8 +337,13 @@ def status():
     click.echo(f"Driver Mode:       {mode}")
     
     # 3. Fan Speed
-    rpm = controller.get_fan_speed()
-    click.echo(f"Fan Speed:         {rpm} RPM")
+    active_fan = controller.get_active_fan_index() if hasattr(controller, "get_active_fan_index") else (1 if controller.is_fan_telemetry_available(1) else (2 if controller.is_fan_telemetry_available(2) else None))
+    if active_fan is not None and controller.is_fan_telemetry_available(active_fan):
+        rpm = controller.get_fan_speed()
+        rpm_display = f"{rpm} RPM"
+    else:
+        rpm_display = "N/A (telemetry not detected)"
+    click.echo(f"Fan Speed:         {rpm_display}")
     
     # 4. Temperatures
     pkg_temp = controller.get_cpu_temp()

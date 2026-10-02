@@ -108,7 +108,7 @@ class FanController(
         _save_config(self.config, self.config_path, volatile=volatile, source=source)
 
     def write_sys_file(self, path: Path | str | None, value: int | str) -> None:
-        if not path:
+        if not path or not self.fan_control_available:
             return
         try:
             with open(path, "w") as f:
@@ -141,34 +141,74 @@ class FanController(
         except Exception:
             return 0, False
 
-    def get_fan_speed(self) -> int:
+    def get_active_fan_index(self) -> int | None:
+        """Returns the 1-based index (1 for Fan 1/CPU, 2 for Fan 2/GPU) of the fan
+        whose telemetry value is reported by get_fan_speed / get_fan_speed_info,
+        or None if neither fan's telemetry is available.
+        """
+        f1_avail = self.is_fan_telemetry_available(1)
+        f2_avail = self.is_fan_telemetry_available(2)
+        if not f1_avail and not f2_avail:
+            return None
+        if f1_avail and not f2_avail:
+            return 1
+        if f2_avail and not f1_avail:
+            return 2
+
         val1 = self.read_sys_file(self.fan1_input_path)
         val2 = self.read_sys_file(self.fan2_input_path)
+        rpm1, _ = self.parse_hwmon_rpm(val1)
+        rpm2, _ = self.parse_hwmon_rpm(val2)
+        return 2 if rpm2 > rpm1 else 1
+
+    def get_fan_speed(self) -> int:
+        idx = self.get_active_fan_index()
+        if idx is None:
+            return 0
+
+        f1_avail = self.is_fan_telemetry_available(1)
+        f2_avail = self.is_fan_telemetry_available(2)
+
+        val1 = self.read_sys_file(self.fan1_input_path) if f1_avail else ""
+        val2 = self.read_sys_file(self.fan2_input_path) if f2_avail else ""
 
         rpm1, is_rev1 = self.parse_hwmon_rpm(val1)
         rpm2, is_rev2 = self.parse_hwmon_rpm(val2)
+
+        rpm = rpm2 if idx == 2 else rpm1
+        is_rev = is_rev2 if idx == 2 else (is_rev1 or (is_rev2 if f2_avail else False))
 
         if val1 or val2:
-            raw_log = f"sysfs fan1={val1}, fan2={val2}"
+            raw_log = f"sysfs fan1={val1 or 'N/A'}, fan2={val2 or 'N/A'}"
             if not hasattr(self, "_last_logged_raw_rpm") or self._last_logged_raw_rpm != raw_log:
                 self._last_logged_raw_rpm = raw_log
-                self.log_cleaner(f"HWMON SYSFS READINGS -> {raw_log} => Parsed RPM: {max(rpm1, rpm2)} (Reverse: {is_rev1 or is_rev2})")
+                self.log_cleaner(f"HWMON SYSFS READINGS -> {raw_log} => Parsed RPM: {rpm} (Reverse: {is_rev})")
 
-        return max(rpm1, rpm2)
+        return rpm
 
     def get_fan_speed_info(self) -> tuple[int, bool]:
-        val1 = self.read_sys_file(self.fan1_input_path)
-        val2 = self.read_sys_file(self.fan2_input_path)
+        idx = self.get_active_fan_index()
+        if idx is None:
+            return 0, False
+
+        f1_avail = self.is_fan_telemetry_available(1)
+        f2_avail = self.is_fan_telemetry_available(2)
+
+        val1 = self.read_sys_file(self.fan1_input_path) if f1_avail else ""
+        val2 = self.read_sys_file(self.fan2_input_path) if f2_avail else ""
 
         rpm1, is_rev1 = self.parse_hwmon_rpm(val1)
         rpm2, is_rev2 = self.parse_hwmon_rpm(val2)
 
-        is_reverse = is_rev1 or is_rev2
-        return max(rpm1, rpm2), is_reverse
+        if idx == 2:
+            return rpm2, is_rev2
+        else:
+            is_rev = is_rev1 or (is_rev2 if f2_avail else False)
+            return rpm1, is_rev
 
     def get_both_fan_speeds(self) -> list[tuple[str, int, bool]]:
-        val1 = self.read_sys_file(self.fan1_input_path)
-        val2 = self.read_sys_file(self.fan2_input_path)
+        val1 = self.read_sys_file(self.fan1_input_path) if self.is_fan_telemetry_available(1) else ""
+        val2 = self.read_sys_file(self.fan2_input_path) if self.is_fan_telemetry_available(2) else ""
 
         rpm1, is_rev1 = self.parse_hwmon_rpm(val1)
         rpm2, is_rev2 = self.parse_hwmon_rpm(val2)
@@ -269,7 +309,44 @@ class FanController(
 
         return params
 
+    def get_interface_state(self) -> str:
+        """Returns 'available', 'incomplete', or 'absent'.
+
+        'absent': hwmon path does not exist.
+        'incomplete': hwmon path exists, but one or more required control files
+                      (pwm1_enable, pwm1, pwm2) are missing.
+        'available': all required control sysfs files are present (write operations
+                     still require appropriate root/elevation privileges).
+        """
+        if not self.hwmon_path:
+            return "absent"
+        if hasattr(self.hwmon_path, "exists") and not self.hwmon_path.exists():
+            return "absent"
+        required = [self.pwm1_enable_path, self.pwm1_path, self.pwm2_path]
+        if any(p is None or (hasattr(p, "exists") and not p.exists()) for p in required):
+            return "incomplete"
+        return "available"
+
+    @property
+    def fan_control_available(self) -> bool:
+        """True only when all required control files exist (does not guarantee write permissions)."""
+        return self.get_interface_state() == "available"
+
+    def is_fan_telemetry_available(self, fan: int = 1) -> bool:
+        """True if the RPM sysfs input file for the specified fan exists."""
+        if not self.hwmon_path or (hasattr(self.hwmon_path, "exists") and not self.hwmon_path.exists()):
+            return False
+        path = self.fan1_input_path if fan == 1 else self.fan2_input_path
+        return bool(path and (not hasattr(path, "exists") or path.exists()))
+
+    @property
+    def fan_telemetry_available(self) -> bool:
+        """True if at least one fan RPM telemetry input path exists."""
+        return self.is_fan_telemetry_available(1) or self.is_fan_telemetry_available(2)
+
     def set_fan_mode(self, mode: str) -> None:
+        if not self.fan_control_available:
+            return
         if mode == 'max':
             self.write_sys_file(self.pwm1_enable_path, 0)
         elif mode == 'auto':
@@ -339,6 +416,8 @@ class FanController(
         return max(cpu_m, gpu_m)
 
     def set_fan_pwm(self, value: int, gpu_value: int | None = None) -> None:
+        if not self.fan_control_available:
+            return
         current_enable = self.read_sys_file(self.pwm1_enable_path)
         if current_enable != "1":
             self.write_sys_file(self.pwm1_enable_path, 1)
@@ -448,6 +527,9 @@ class FanController(
         return cpu_pwm, cpu_pwm
 
     def calibrate(self) -> Generator[int, None, tuple[int, int]]:
+        if not self.fan_control_available:
+            raise RuntimeError("Fan control interface unavailable. Calibration aborted.")
+
         print("Starting calibration...")
 
         try:

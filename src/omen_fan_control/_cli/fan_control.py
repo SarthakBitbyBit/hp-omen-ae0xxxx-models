@@ -64,6 +64,10 @@ def fan_control(
                 click.echo("Stopping service for temporary manual control...")
                 controller.stop_service()
 
+    if not controller.fan_control_available:
+        click.echo("Error: Fan control interface is not available.")
+        sys.exit(1)
+
     if mode == "auto":
         controller.set_fan_mode("auto")
         controller.config["mode"] = "auto"

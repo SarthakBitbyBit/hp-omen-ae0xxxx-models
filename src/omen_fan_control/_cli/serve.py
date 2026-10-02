@@ -8,6 +8,9 @@ import click
 from .._constants import VOLATILE_CONFIG_FILE
 from . import get_controller
 
+# Re-probe the hwmon interface at this interval when it is absent (seconds).
+_REPROBE_INTERVAL = 30
+
 
 @click.command()
 def serve() -> None:
@@ -15,12 +18,19 @@ def serve() -> None:
     controller = get_controller()
     click.echo("Starting Omen Fan Control Daemon...")
 
+    # Reverse-mode recovery at startup — independent of hp-wmi PWM interface.
     try:
         if controller.is_reverse_mode_active():
             click.echo("Recovery: Reverse mode detected on daemon startup. Initiating stop sequence...")
             controller.stop_fan_cleaning()
     except Exception as e:
         click.echo(f"Startup reverse mode check failed: {e}")
+
+    if not controller.fan_control_available:
+        click.echo(
+            "Fan control interface absent at startup — skipping fan writes. "
+            f"Will re-probe every {_REPROBE_INTERVAL}s."
+        )
 
     ma_window = controller.config.get("ma_window", 5)
     initial_temp = controller.get_reference_temp() or 40.0
@@ -43,14 +53,18 @@ def serve() -> None:
     last_volatile_mtime: float = 0
     cleaner_temp_history: list[float] = []
 
+    # Track re-probe timing and log-suppression for unavailable interface.
+    last_reprobe_time: float = 0.0
+    _logged_unavailable: bool = False
+
     while True:
         try:
+            # --- Config reload (on-disk change detection) ---
             try:
                 current_mtime = controller.config_path.stat().st_mtime
                 current_v_mtime = 0.0
                 if VOLATILE_CONFIG_FILE.exists():
                     current_v_mtime = VOLATILE_CONFIG_FILE.stat().st_mtime
-
                 if current_mtime > last_config_mtime or current_v_mtime > last_volatile_mtime:
                     controller.config = controller.load_config()
                     last_config_mtime = controller.config_path.stat().st_mtime if controller.config_path.exists() else 0
@@ -60,7 +74,6 @@ def serve() -> None:
                 pass
 
             mode = controller.config.get("mode", "auto")
-
             if mode == "calibration":
                 time.sleep(1)
                 continue
@@ -68,9 +81,15 @@ def serve() -> None:
             if time.time() - last_watchdog_time > watchdog_interval:
                 last_watchdog_time = time.time()
 
+            # --- Temperature monitoring: always runs, independent of fan-control availability ---
             current_temp = controller.get_reference_temp()
 
-            cleaner_active = controller.config.get("cleaner_in_progress", False) or controller.config.get("cleaner_transitioning", False)
+            # --- Active cleaner: temperature-safety monitoring continues even when hwmon absent,
+            #     but fan writes inside stop_fan_cleaning are guarded by the controller itself. ---
+            cleaner_active = (
+                controller.config.get("cleaner_in_progress", False)
+                or controller.config.get("cleaner_transitioning", False)
+            )
             if cleaner_active:
                 cleaner_in_progress = controller.config.get("cleaner_in_progress", False)
                 if cleaner_in_progress:
@@ -79,12 +98,14 @@ def serve() -> None:
                         ma_win = controller.config.get("ma_window", 5)
                         if len(cleaner_temp_history) > ma_win:
                             cleaner_temp_history.pop(0)
-
                         if len(cleaner_temp_history) >= 3:
                             avg_cleaner_temp = sum(cleaner_temp_history) / len(cleaner_temp_history)
                             if avg_cleaner_temp > 75:
                                 reason = f"Stopped early: CPU reached {avg_cleaner_temp:.1f}°C (> 75°C)"
-                                controller.log_cleaner(f"SAFETY ABORT: Daemon CPU average reached {avg_cleaner_temp:.1f}°C (> 75°C) during fan cleaning. Aborting immediately!")
+                                controller.log_cleaner(
+                                    f"SAFETY ABORT: Daemon CPU average reached {avg_cleaner_temp:.1f}°C "
+                                    f"(> 75°C) during fan cleaning. Aborting immediately!"
+                                )
                                 click.echo(f"WARNING: {reason}. Aborting immediately!")
                                 controller.stop_fan_cleaning(reason=reason)
                     start_time = controller.config.get("cleaner_start_time", 0)
@@ -99,17 +120,40 @@ def serve() -> None:
             else:
                 cleaner_temp_history.clear()
 
+            # --- Re-probe hwmon when absent: deliberate interval, not every iteration ---
+            if not controller.fan_control_available:
+                now = time.time()
+                if now - last_reprobe_time >= _REPROBE_INTERVAL:
+                    controller._find_paths()
+                    last_reprobe_time = now
+
+            if not controller.fan_control_available:
+                # Log once; suppress repeats until resolved.
+                if not _logged_unavailable:
+                    click.echo(
+                        "Fan control interface absent — skipping fan writes. "
+                        "Temperature monitoring continues. "
+                        f"Will re-probe every {_REPROBE_INTERVAL}s."
+                    )
+                    _logged_unavailable = True
+                time.sleep(2)
+                continue
+
+            # Interface is available. Reset suppression flag if it was set.
+            if _logged_unavailable:
+                click.echo("Fan control interface detected — resuming fan-control writes.")
+                _logged_unavailable = False
+
+            # --- Automatic fan cleaning (requires fan control) ---
             cleaner_enabled = controller.config.get("cleaner_enabled", False)
             if cleaner_enabled:
                 raw_interval = controller.config.get("cleaner_interval", 14400)
                 interval = max(raw_interval, 300)
                 last_run = controller.config.get("cleaner_last_run", 0)
-
                 if last_run == 0 or (daemon_start_time - last_run >= interval):
                     due = (time.time() - daemon_start_time) >= interval
                 else:
                     due = (time.time() - last_run) >= interval
-
                 if due:
                     if current_temp is not None and current_temp <= 75:
                         click.echo(f"Triggering automatic fan cleaning cycle (interval: {interval}s)...")
@@ -124,15 +168,21 @@ def serve() -> None:
                         else:
                             click.echo(f"Failed to start automatic fan cleaning: {msg}")
 
+            # --- Temperature moving-average (requires fan control to be meaningful for curve) ---
             ma_window = controller.config.get("ma_window", 5)
             if current_temp is not None:
                 temp_history.append(float(current_temp))
             if len(temp_history) > ma_window:
                 temp_history.pop(0)
-            avg_temp = sum(temp_history) / len(temp_history) if temp_history else (float(current_temp) if current_temp else 40.0)
+            avg_temp = (
+                sum(temp_history) / len(temp_history)
+                if temp_history
+                else (float(current_temp) if current_temp else 40.0)
+            )
 
             gpu_temp = controller.get_gpu_temp()
 
+            # --- Fan-mode writes ---
             if mode == "curve":
                 target_cpu_pwm, target_gpu_pwm = controller.calculate_dual_target_pwm(avg_temp, gpu_temp)
                 current_rpm = controller.get_fan_speed()
@@ -140,7 +190,7 @@ def serve() -> None:
 
                 should_apply = True
 
-                if max_rpm > 0:
+                if max_rpm > 0 and controller.fan_telemetry_available:
                     target_rpm = (target_cpu_pwm / 255) * max_rpm
                     diff = abs(target_rpm - current_rpm)
 

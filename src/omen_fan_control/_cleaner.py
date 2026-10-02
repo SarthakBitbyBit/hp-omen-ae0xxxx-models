@@ -252,20 +252,31 @@ class FanCleanerMixin:
         return False
 
     def is_reverse_mode_active(self) -> bool:
+        controller: FanController = self
+
         self.check_cleaner_auto_stop()
 
-        controller: FanController = self
-        cfg = controller.load_config()
-        if cfg.get("cleaner_in_progress", False):
+        cfg = controller.load_config() if hasattr(controller, "load_config") else {}
+        if (isinstance(cfg, dict) and cfg.get("cleaner_in_progress", False)) or controller.config.get("cleaner_in_progress", False):
             return True
 
         try:
-            val1 = controller.read_sys_file(controller.fan1_input_path)
-            val2 = controller.read_sys_file(controller.fan2_input_path)
+            val1 = controller.read_sys_file(controller.fan1_input_path) if getattr(controller, "fan1_input_path", None) else None
+            val2 = controller.read_sys_file(controller.fan2_input_path) if getattr(controller, "fan2_input_path", None) else None
             if (val1 and int(val1) >= 12800) or (val2 and int(val2) >= 12800):
                 return True
         except Exception:
             pass
+
+        if os.path.exists("/proc/acpi/call"):
+            try:
+                raw_resp = self.cleaner_acpi_call(method_id=3, command=131080, command_type=44, data_size=128, payload_bytes=[0]*128)
+                success, info, data = self.cleaner_parse_response(raw_resp)
+                if success and isinstance(info, dict) and info.get("sig") == "PASS" and info.get("code") == 0:
+                    if len(data) > 0 and (data[0] & 0x80):
+                        return True
+            except Exception:
+                pass
 
         return False
 
@@ -273,6 +284,10 @@ class FanCleanerMixin:
         self.log_cleaner(f"START REQUESTED -> speed parameter: {speed}")
 
         controller = self  # type: FanController
+
+        if not controller.fan_control_available:
+            self.log_cleaner("START REJECTED -> Fan control interface is not available.")
+            return False, "Fan control interface is not available."
 
         lock_handle = self._acquire_cleaner_lock(timeout=0.0)
         if lock_handle is None:
@@ -470,7 +485,11 @@ class FanCleanerMixin:
         status_msg = reason or f"Completed ({dur}s)"
         self.log_cleaner(f"STOP CLEANING REQUESTED -> Reason: {status_msg}")
 
-        if not controller.config.get("cleaner_in_progress", False) and not controller.config.get("cleaner_transitioning", False):
+        if (
+            not controller.config.get("cleaner_in_progress", False)
+            and not controller.config.get("cleaner_transitioning", False)
+            and not self.is_reverse_mode_active()
+        ):
             self.log_cleaner("STOP SKIPPED -> Cleaner is not active.")
             return True, "Cleaner is not active."
 
@@ -647,6 +666,10 @@ class FanCleanerMixin:
 
     def apply_post_cleaner_mode(self) -> None:
         controller = self  # type: FanController
+        if not controller.fan_control_available:
+            self.log_cleaner("APPLY POST CLEANER MODE SKIPPED -> Fan control interface is not available.")
+            return
+
         mode = controller.config.get("mode", "auto")
         self.log_cleaner(f"APPLY POST CLEANER MODE -> Target mode: '{mode}'")
         try:

@@ -54,6 +54,7 @@ SUPPORTED_BOARDS: set[str] = {
     "8BAB", "8BB3", "8BBE", "8BCA", "8BD4", "8BD5", "8C76", "8C77", "8C78", "8BCD",
     "8C4D", "8C99", "8C9C", "8D26", "8D41", "8D87", "8A44", "8A4D", "8C58", "8BA9", "8BAA",
     "8A3D", "8A43", "8B2F", "8C2F", "8BC2", "8D88", "8DD6", "8E35",
+    "8CC0",
 }
 
 POSSIBLY_SUPPPORTED_OMEN_BOARDS: set[str] = {
@@ -67,6 +68,6 @@ POSSIBLY_SUPPPORTED_OMEN_BOARDS: set[str] = {
     "8B1D", "89EB", "8A4C", "8A4D", "8A4E", "8A40", "8A41", "8A42", "8A43",
     "8A44", "8BA8", "8BA9", "8BAA", "8BAC", "8C76", "8C77", "8C78",
     "8BCA", "8BCB", "8BCF", "8C9B", "8BB4", "8C4E",
-    "8C58", "8C75", "8C74", "8C73", "8CC1", "8CC0", "8CF1", "8CF2", "8CF3",
+    "8C58", "8C75", "8C74", "8C73", "8CC1", "8CF1", "8CF2", "8CF3",
     "8CF4", "8D2F",
 }

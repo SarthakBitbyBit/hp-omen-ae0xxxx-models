@@ -298,11 +298,12 @@ class FanSpeedDialog(QDialog):
 
     def refresh_fans(self):
         fans = self.controller.get_both_fan_speeds()
+
         if not fans:
             return
 
         if not self.fan_cards:
-            for name, rpm, is_rev in fans:
+            for idx, (name, rpm, is_rev) in enumerate(fans):
                 card = QFrame()
                 card.setObjectName("FanCard")
                 card_layout = QVBoxLayout(card)
@@ -314,15 +315,28 @@ class FanSpeedDialog(QDialog):
                 lbl_name.setObjectName("FanTitle")
                 lbl_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-                rpm_text = f"-{rpm} RPM" if (is_rev and rpm > 0) else f"{rpm} RPM"
+                if hasattr(self.controller, "is_fan_telemetry_available") and callable(self.controller.is_fan_telemetry_available):
+                    unavailable = not self.controller.is_fan_telemetry_available(idx + 1)
+                elif hasattr(self.controller, "fan_telemetry_available"):
+                    val = self.controller.fan_telemetry_available
+                    unavailable = not (val() if callable(val) else val)
+                else:
+                    unavailable = not getattr(self.controller, "fan_telemetry_available", True)
+
+                if unavailable:
+                    rpm_text = "N/A"
+                elif is_rev and rpm > 0:
+                    rpm_text = f"-{rpm} RPM"
+                else:
+                    rpm_text = f"{rpm} RPM"
                 lbl_val = QLabel(rpm_text)
                 lbl_val.setObjectName("FanVal")
                 lbl_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-                lbl_rev = QLabel("(Reverse)" if (is_rev and rpm > 0) else "")
+                lbl_rev = QLabel("(Reverse)" if (is_rev and rpm > 0 and not unavailable) else "")
                 lbl_rev.setObjectName("FanRev")
                 lbl_rev.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                if not (is_rev and rpm > 0):
+                if not (is_rev and rpm > 0 and not unavailable):
                     lbl_rev.setVisible(False)
 
                 card_layout.addWidget(lbl_name)
@@ -332,15 +346,26 @@ class FanSpeedDialog(QDialog):
                 self.cards_layout.addWidget(card)
                 self.fan_cards[name] = (lbl_val, lbl_rev)
         else:
-            for name, rpm, is_rev in fans:
+            for idx, (name, rpm, is_rev) in enumerate(fans):
                 if name in self.fan_cards:
                     lbl_val, lbl_rev = self.fan_cards[name]
-                    rpm_text = f"-{rpm} RPM" if (is_rev and rpm > 0) else f"{rpm} RPM"
-                    lbl_val.setText(rpm_text)
-                    if is_rev and rpm > 0:
+                    if hasattr(self.controller, "is_fan_telemetry_available") and callable(self.controller.is_fan_telemetry_available):
+                        unavailable = not self.controller.is_fan_telemetry_available(idx + 1)
+                    elif hasattr(self.controller, "fan_telemetry_available"):
+                        val = self.controller.fan_telemetry_available
+                        unavailable = not (val() if callable(val) else val)
+                    else:
+                        unavailable = not getattr(self.controller, "fan_telemetry_available", True)
+
+                    if unavailable:
+                        lbl_val.setText("N/A")
+                        lbl_rev.setVisible(False)
+                    elif is_rev and rpm > 0:
+                        lbl_val.setText(f"-{rpm} RPM")
                         lbl_rev.setText("(Reverse)")
                         lbl_rev.setVisible(True)
                     else:
+                        lbl_val.setText(f"{rpm} RPM")
                         lbl_rev.setVisible(False)
 
 

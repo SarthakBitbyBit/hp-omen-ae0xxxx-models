@@ -349,6 +349,7 @@ struct hp_wmi_fan_profile_params {
 struct hp_wmi_board_params {
 	const struct thermal_profile_params *thermal_profile;
 	const struct hp_wmi_fan_profile_params *fan_profile;
+	bool apply_fan_settings_on_init;
 };
 
 static int hp_wmi_get_fan_speed_victus_s(int fan);
@@ -361,21 +362,50 @@ static const struct hp_wmi_fan_profile_params victus_s_fan_profile_params = {
 static const struct hp_wmi_board_params victus_s_board_params = {
 	.thermal_profile = &victus_s_thermal_params,
 	.fan_profile = &victus_s_fan_profile_params,
+	.apply_fan_settings_on_init = true,
 };
 
 static const struct hp_wmi_board_params omen_v1_board_params = {
 	.thermal_profile = &omen_v1_thermal_params,
 	.fan_profile = &victus_s_fan_profile_params,
+	.apply_fan_settings_on_init = true,
 };
 
 static const struct hp_wmi_board_params omen_v1_legacy_board_params = {
 	.thermal_profile = &omen_v1_legacy_thermal_params,
 	.fan_profile = &victus_s_fan_profile_params,
+	.apply_fan_settings_on_init = true,
 };
 
 static const struct hp_wmi_board_params omen_v1_no_ec_board_params = {
 	.thermal_profile = &omen_v1_no_ec_thermal_params,
 	.fan_profile = &victus_s_fan_profile_params,
+	.apply_fan_settings_on_init = true,
+};
+
+/*
+ * Board params for boards whose fan-control and thermal-profile WMI/EC protocols
+ * have not been verified.
+ *
+ * fan_profile = NULL: causes hp_wmi_hwmon_init() to return before any fan setup
+ * queries (0x26, 0x2F), fan telemetry queries (0x2D), initial fan-control writes
+ * (0x10, 0x27, 0x2E), or hwmon device registration. No writable fan-control sysfs
+ * attributes are created. apply_fan_settings_on_init is a no-op on this board
+ * because hwmon init returns early before that check is reached.
+ *
+ * thermal_profile = NULL: causes thermal_profile_setup() to return before any
+ * thermal-profile EC reads or writes (offsets 0x59, 0x95), thermal-profile WMI
+ * queries (0x1A, 0x21, 0x22, 0x4c), or platform_profile registration.
+ * is_victus_s_board remains false.
+ *
+ * Note: module load still issues non-fan WMI operations including the hardware
+ * detection query (0x04), keyboard RGB probe, and lightbar probe. Module loading
+ * is not a wholly passive operation.
+ */
+static const struct hp_wmi_board_params omen_v1_no_tp_board_params = {
+	.thermal_profile = NULL, /* thermal protocol unverified - skip thermal-profile setup */
+	.fan_profile     = NULL, /* fan-control protocol unverified - skip hwmon registration */
+	.apply_fan_settings_on_init = false,
 };
 
 static const struct hp_wmi_board_params *active_board_params;
@@ -510,6 +540,10 @@ static const struct dmi_system_id hp_wmi_feature_boards[] __initconst = {
 	{
 		.matches = {DMI_MATCH(DMI_BOARD_NAME, "8C78")},
 		.driver_data = (void *)&omen_v1_board_params,
+	},
+	{
+		.matches = {DMI_MATCH(DMI_BOARD_NAME, "8CC0")},
+		.driver_data = (void *)&omen_v1_no_tp_board_params,
 	},
 	{
 		.matches = {DMI_MATCH(DMI_BOARD_NAME, "8C99")},
@@ -992,8 +1026,15 @@ static int hp_wmi_get_fan_count_userdefine_trigger(void)
 	int ret;
 
 	ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM, &fan_data, sizeof(u8), sizeof(fan_data));
-	if (ret != 0)
+	if (ret != 0) {
+		if (ret > 0)
+			pr_warn_ratelimited("fan count query (0x%02x) rejected by firmware: 0x%02x\n",
+					    HPWMI_FAN_COUNT_GET_QUERY, (unsigned int)ret);
+		else
+			pr_warn_ratelimited("fan count query (0x%02x) WMI error: %d\n",
+					    HPWMI_FAN_COUNT_GET_QUERY, ret);
 		return -EINVAL;
+	}
 
 	return fan_data[0]; /* Others bytes aren't providing fan count */
 }
@@ -1024,8 +1065,16 @@ static int hp_wmi_get_fan_speed_victus_s(int fan)
 
 	ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY, HPWMI_GM, &fan_data, sizeof(u8),
 				   sizeof(fan_data));
-	if (ret != 0)
+	if (ret != 0) {
+		if (ret > 0)
+			pr_warn_ratelimited("fan speed-get query (0x%02x) rejected by firmware: 0x%02x\n",
+					    HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY, (unsigned int)ret);
+		else
+			pr_warn_ratelimited("fan speed-get query (0x%02x) WMI error: %d\n",
+					    HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY, ret);
 		return -EINVAL;
+	}
+	/* ret == 0: fan_data[fan] == 0 may be genuine zero RPM or wrong byte index */
 
 	return fan_data[fan] * 100;
 }
@@ -1142,8 +1191,15 @@ static int hp_wmi_fan_speed_max_set(int enabled)
 
 	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, HPWMI_GM, &enabled, sizeof(enabled), 0);
 
-	if (ret)
+	if (ret) {
+		if (ret > 0)
+			pr_warn_ratelimited("fan max-speed query (0x%02x) rejected by firmware: 0x%02x\n",
+					    HPWMI_FAN_SPEED_MAX_SET_QUERY, (unsigned int)ret);
+		else
+			pr_warn_ratelimited("fan max-speed query (0x%02x) WMI error: %d\n",
+					    HPWMI_FAN_SPEED_MAX_SET_QUERY, ret);
 		return ret < 0 ? ret : -EINVAL;
+	}
 
 	return enabled;
 }
@@ -1172,7 +1228,17 @@ static int hp_wmi_fan_speed_set(struct hp_wmi_hwmon_priv *priv)
 		return ret;
 	ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, HPWMI_GM, &fan_speed, sizeof(fan_speed), 0);
 
-	return ret;
+	if (ret) {
+		if (ret > 0)
+			pr_warn_ratelimited("fan speed-set query (0x%02x) rejected by firmware: 0x%02x\n",
+					    HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, (unsigned int)ret);
+		else
+			pr_warn_ratelimited("fan speed-set query (0x%02x) WMI error: %d\n",
+					    HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, ret);
+		return ret < 0 ? ret : -EINVAL;
+	}
+
+	return 0;
 }
 
 static int hp_wmi_fan_speed_reset(struct hp_wmi_hwmon_priv *priv)
@@ -2654,6 +2720,26 @@ static int thermal_profile_setup(struct platform_device *device)
 	const struct thermal_profile_params *params;
 	int err, tp;
 
+	/*
+	 * If the active board has no verified thermal-profile parameters, skip
+	 * all thermal-profile EC reads, EC writes, and WMI thermal-profile
+	 * operations. Do not register a platform_profile interface.
+	 *
+	 * This guard complements the NULL check in setup_active_board_params():
+	 * that check prevents is_victus_s_board from being set (blocking EC 0x59);
+	 * this guard prevents the generic WMI thermal-profile path from executing
+	 * and prevents erroneous platform_profile registration.
+	 *
+	 * Note: module load still issues fan-control WMI writes (queries 0x10,
+	 * 0x27, 0x2E) via hp_wmi_apply_fan_settings(). Loading this module is
+	 * not a read-only operation.
+	 */
+	if (active_board_params && !active_board_params->thermal_profile) {
+		pr_info("Thermal profile support not verified for this board — "
+			"platform_profile not registered\n");
+		return 0;
+	}
+
 	if (is_omen_thermal_profile()) {
 		err = platform_profile_omen_get_ec(&active_platform_profile);
 		if (err < 0)
@@ -3241,7 +3327,11 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 	if (err < 0)
 		return err;
 
-	thermal_profile_setup(device);
+	err = thermal_profile_setup(device);
+	if (err)
+		dev_warn(&device->dev,
+			 "Thermal profile setup failed (%d): platform_profile not registered\n",
+			 err);
 
 	err = hp_kbd_rgb_setup();
 	if (err)
@@ -3682,6 +3772,20 @@ static int hp_wmi_hwmon_init(void)
 	struct device *hwmon;
 	int ret;
 
+	/*
+	 * If the active board has no verified fan-control parameters, skip all
+	 * fan setup queries (0x26, 0x2F), fan telemetry queries (0x2D), initial
+	 * fan-control writes (0x10, 0x27, 0x2E), and hwmon device registration.
+	 * This prevents unverified fan-control WMI operations and ensures no
+	 * writable fan-control sysfs attributes are created for this board.
+	 * Boards without a DMI match (active_board_params == NULL) are not
+	 * affected and proceed through the normal initialization path.
+	 */
+	if (active_board_params && !active_board_params->fan_profile) {
+		pr_info("HP WMI: Fan control support not verified for this board - hwmon not registered\n");
+		return 0;
+	}
+
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
@@ -3702,9 +3806,11 @@ static int hp_wmi_hwmon_init(void)
 
 	INIT_DELAYED_WORK(&priv->keep_alive_dwork, hp_wmi_hwmon_keep_alive_handler);
 	platform_set_drvdata(hp_wmi_platform_dev, priv);
-	ret = hp_wmi_apply_fan_settings(priv);
-	if (ret)
-		dev_warn(dev, "Failed to apply initial fan settings: %d\n", ret);
+	if (!active_board_params || active_board_params->apply_fan_settings_on_init) {
+		ret = hp_wmi_apply_fan_settings(priv);
+		if (ret)
+			dev_warn(dev, "Failed to apply initial fan settings: %d\n", ret);
+	}
 
 	return 0;
 }
