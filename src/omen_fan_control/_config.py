@@ -23,6 +23,7 @@ class ConfigDict(TypedDict, total=False):
     watchdog_interval: int
     ma_window: int
     curve: list[list[int]]
+    performance_curve: list[list[float]]
     bypass_patch_warning: bool
     mode: str
     manual_pwm: int
@@ -81,6 +82,7 @@ DEFAULT_CONFIG: ConfigDict = {
     "watchdog_interval": DEFAULT_WATCHDOG_INTERVAL,
     "ma_window": 5,
     "curve": [],
+    "performance_curve": [],
     "bypass_patch_warning": False,
     "mode": "auto",
     "manual_pwm": 0,

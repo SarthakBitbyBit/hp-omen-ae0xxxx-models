@@ -16,6 +16,7 @@ from ._constants import (
     HWMON_PATH_PATTERN,
     SUPPORTED_BOARDS,
     POSSIBLY_SUPPPORTED_OMEN_BOARDS,
+    MONITORING_ONLY_BOARDS,
 )
 from ._driver import DriverInstallerMixin
 from ._service import ServiceManagerMixin
@@ -26,6 +27,18 @@ class FanController(
     DriverInstallerMixin,
     ServiceManagerMixin,
 ):
+    hwmon_path: Path | None = None
+    pwm1_enable_path: Path | None = None
+    pwm2_enable_path: Path | None = None
+    pwm1_path: Path | None = None
+    pwm2_path: Path | None = None
+    fan1_input_path: Path | None = None
+    fan2_input_path: Path | None = None
+    fan1_max_path: Path | None = None
+    fan2_max_path: Path | None = None
+    cpu_temp_path: Path | None = None
+    config_path: Path = CONFIG_FILE
+
     def __init__(self, config_path: str | Path | None = None) -> None:
         self._find_paths()
         if config_path:
@@ -40,20 +53,33 @@ class FanController(
             if not start_ts or (time.time() - start_ts >= 30):
                 self.emergency_stop_fan_cleaning()
 
+    def _get_live_board_name(self) -> str | None:
+        try:
+            with open("/sys/class/dmi/id/board_name") as f:
+                return f.read().strip()
+        except Exception:
+            return None
+
+    def _is_monitoring_only_board(self) -> bool:
+        """Whether the live board (or, if unavailable, cached board) forbids writes."""
+        board_name = self._get_live_board_name() or self.config.get("cached_board_name", "")
+        return str(board_name) in MONITORING_ONLY_BOARDS
+
     def check_board_support(self) -> tuple[str, str]:
-        cached = self.config.get("cached_board_name")
-        if cached:
-            board_name = str(cached)
-        else:
-            try:
-                with open("/sys/class/dmi/id/board_name") as f:
-                    board_name = f.read().strip()
+        board_name = self._get_live_board_name()
+        if board_name:
+            if board_name != self.config.get("cached_board_name"):
                 self.config["cached_board_name"] = board_name
                 self.save_config()
-            except Exception as e:
-                print(f"Error reading board name: {e}")
+        else:
+            cached = self.config.get("cached_board_name")
+            if not cached:
+                print("Error reading board name")
                 return "UNSUPPORTED", "Unknown"
+            board_name = str(cached)
 
+        if board_name in MONITORING_ONLY_BOARDS:
+            return "MONITORING_ONLY", board_name
         if board_name in SUPPORTED_BOARDS:
             return "SUPPORTED", board_name
         elif board_name in POSSIBLY_SUPPPORTED_OMEN_BOARDS:
@@ -66,6 +92,7 @@ class FanController(
         if not paths:
             self.hwmon_path = None
             self.pwm1_enable_path = None
+            self.pwm2_enable_path = None
             self.pwm1_path = None
             self.pwm2_path = None
             self.fan1_input_path = None
@@ -74,6 +101,7 @@ class FanController(
 
         self.hwmon_path = Path(paths[0])
         self.pwm1_enable_path = self.hwmon_path / "pwm1_enable"
+        self.pwm2_enable_path = self.hwmon_path / "pwm2_enable"
         self.pwm1_path = self.hwmon_path / "pwm1"
         self.pwm2_path = self.hwmon_path / "pwm2"
         self.fan1_input_path = self.hwmon_path / "fan1_input"
@@ -109,6 +137,9 @@ class FanController(
 
     def write_sys_file(self, path: Path | str | None, value: int | str) -> None:
         if not path or not self.fan_control_available:
+            return
+        if self._is_monitoring_only_board():
+            print("Fan write blocked: board is monitoring-only.")
             return
         try:
             with open(path, "w") as f:
@@ -347,10 +378,16 @@ class FanController(
     def set_fan_mode(self, mode: str) -> None:
         if not self.fan_control_available:
             return
-        if mode == 'max':
+        if mode == "max":
+            # Existing hwmon interface convention: enable=0 requests full speed.
+            # This requests, but does not claim to verify, a particular RPM.
             self.write_sys_file(self.pwm1_enable_path, 0)
-        elif mode == 'auto':
+            if self.pwm2_enable_path and self.pwm2_enable_path.exists():
+                self.write_sys_file(self.pwm2_enable_path, 0)
+        elif mode == "auto":
             self.write_sys_file(self.pwm1_enable_path, 2)
+            if self.pwm2_enable_path and self.pwm2_enable_path.exists():
+                self.write_sys_file(self.pwm2_enable_path, 2)
 
     def get_hardware_fan_limits(self) -> tuple[int, int]:
         c_max = 0
@@ -421,11 +458,30 @@ class FanController(
         current_enable = self.read_sys_file(self.pwm1_enable_path)
         if current_enable != "1":
             self.write_sys_file(self.pwm1_enable_path, 1)
+        if self.pwm2_enable_path and self.pwm2_enable_path.exists():
+            current_gpu_enable = self.read_sys_file(self.pwm2_enable_path)
+            if current_gpu_enable != "1":
+                self.write_sys_file(self.pwm2_enable_path, 1)
         val_str = str(int(value))
         self.write_sys_file(self.pwm1_path, val_str)
         if self.pwm2_path and self.pwm2_path.exists():
             gpu_val_str = str(int(gpu_value)) if gpu_value is not None else val_str
             self.write_sys_file(self.pwm2_path, gpu_val_str)
+
+    @staticmethod
+    def is_valid_curve(curve: object) -> bool:
+        """Return whether a curve can safely be passed to the interpolation engine."""
+        if not isinstance(curve, list) or not curve:
+            return False
+        for point in curve:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                return False
+            temp, percent = point
+            if not isinstance(temp, (int, float)) or not isinstance(percent, (int, float)):
+                return False
+            if not 0 <= percent <= 100:
+                return False
+        return True
 
     def calculate_target_pwm(self, current_temp: int, curve: list[list[float]] | None = None) -> int | None:
         if curve is None:
@@ -460,9 +516,14 @@ class FanController(
 
         return int(round(target_speed_percent / 100 * 255))
 
-    def calculate_dual_target_pwm(self, cpu_temp: int, gpu_temp: int | None = None) -> tuple[int, int]:
+    def calculate_dual_target_pwm(
+        self,
+        cpu_temp: int,
+        gpu_temp: int | None = None,
+        curve_override: list[list[float]] | None = None,
+    ) -> tuple[int, int]:
         method = self.config.get("fan_control_method", "percentage") if self.config.get("use_advanced_fan_control", False) else "percentage"
-        cpu_pwm = self.calculate_target_pwm(cpu_temp)
+        cpu_pwm = self.calculate_target_pwm(cpu_temp, curve=curve_override)
         if cpu_pwm is None:
             cpu_pwm = 0
 
@@ -492,7 +553,7 @@ class FanController(
                 else:
                     effective_gpu_temp = cpu_temp
 
-            gpu_curve = self.config.get("gpu_curve", [])
+            gpu_curve = curve_override if curve_override is not None else self.config.get("gpu_curve", [])
             if not gpu_curve:
                 gpu_pwm = cpu_pwm
             else:

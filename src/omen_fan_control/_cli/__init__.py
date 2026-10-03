@@ -65,6 +65,12 @@ def cli(ctx: click.Context, config: str | None, help_extra: bool) -> None:
             click.echo(click.style(f"WARNING: Your board '{board}' is not in the known compatible list.", fg="red"))
             click.echo(click.style("Using this tool could potentially cause system instability.", fg="red"))
             click.echo("To bypass this warning, set 'bypass_patch_warning' to true in config or toggle in GUI.")
+        elif status == "MONITORING_ONLY":
+            click.echo(click.style(
+                f"NOTE: Board '{board}' supports temperature monitoring only. "
+                "Fan-control protocol is not hardware-validated; fan writes are disabled.",
+                fg="yellow",
+            ))
         elif status == "POSSIBLY_SUPPORTED" and not controller.config.get("enable_experimental", False):
             click.echo(click.style(f"NOTE: Your board '{board}' is valid for experimental support.", fg="yellow"))
             click.echo(click.style("Community patches suggest it uses the Omen thermal path.", fg="yellow"))

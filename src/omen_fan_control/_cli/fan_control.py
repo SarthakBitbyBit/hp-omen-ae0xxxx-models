@@ -9,7 +9,7 @@ from . import _cmd, get_controller
 
 
 @click.command()
-@click.option("--mode", type=click.Choice(["auto", "max", "manual", "curve", "last"]), help="Set fan mode. 'last' loads from config.")
+@click.option("--mode", type=click.Choice(["auto", "performance", "max", "manual", "curve", "last"]), help="Set fan mode. 'last' loads from config.")
 @click.option("--value", required=False, help="Manual value: 0-255 (PWM) or 0-100% (e.g. '50%')")
 @click.option("--curve-csv", required=False, type=click.Path(exists=True), help="CSV file for curve mode (format: temp,percent)")
 @click.option("--no-save", is_flag=True, help="Apply changes temporarily without saving to config.")
@@ -68,11 +68,16 @@ def fan_control(
         click.echo("Error: Fan control interface is not available.")
         sys.exit(1)
 
-    if mode == "auto":
-        controller.set_fan_mode("auto")
-        controller.config["mode"] = "auto"
+    if mode in ("auto", "performance"):
+        controller.config["mode"] = mode
         controller.save_config(volatile=no_save, source=source)
-        click.echo("Fan set to AUTO.")
+        if service_active:
+            click.echo(f"{mode.title()} mode saved. The service will apply the temperature-driven curve.")
+        else:
+            click.echo(
+                f"{mode.title()} mode saved. Start the service for temperature-driven control: "
+                f"{_cmd} service start"
+            )
     elif mode == "max":
         controller.set_fan_mode("max")
         controller.config["mode"] = "max"

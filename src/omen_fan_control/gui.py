@@ -515,7 +515,7 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.setView(QListView()) # Force standard list view for consistent styling
         self.mode_combo.setItemDelegate(NoFocusDelegate()) # Fix focus rect artifact
-        self.mode_combo.addItems(["Auto", "Max", "Manual", "Curve"])
+        self.mode_combo.addItems(["Auto", "Performance", "Max", "Manual", "Curve"])
         self.mode_combo.setFixedHeight(36)
         self.mode_combo.currentTextChanged.connect(self.on_mode_change)
         mode_layout.addWidget(self.mode_combo)
@@ -678,7 +678,7 @@ class MainWindow(QMainWindow):
 
     def restore_saved_fan_settings(self):
         saved_mode = self.controller.config.get("mode", "auto").capitalize()
-        if saved_mode in ["Auto", "Max", "Manual", "Curve"]:
+        if saved_mode in ["Auto", "Performance", "Max", "Manual", "Curve"]:
             self.mode_combo.setCurrentText(saved_mode)
             
         saved_pwm = self.controller.config.get("manual_pwm", -1)
@@ -1578,9 +1578,10 @@ class MainWindow(QMainWindow):
             return
 
         # Local application for non-service users
-        if mode == "auto":
-            self.controller.set_fan_mode("auto")
-            self.status_label.setText("Set mode to Auto")
+        if mode in ("auto", "performance"):
+            self.status_label.setText(
+                f"{mode.title()} mode saved. Start the service for temperature-driven control."
+            )
         elif mode == "max":
             self.controller.set_fan_mode("max")
             self.status_label.setText("Set mode to Max")

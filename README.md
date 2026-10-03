@@ -244,6 +244,15 @@ sudo omen-fan-control service install
 
 You can also install it from the settings page in the graphical interface.
 
+## Testing
+
+Run the full test suite from the repository root. All sysfs interactions in the
+suite are mocked; passing tests do not validate physical fan behaviour.
+
+```bash
+python -m pytest tests/ -v
+```
+
 ## Fan Cleaning
 
 This is currently the only Linux utility capable of recreating the fan cleaning routine. On supported laptops, it reverses fan spin direction to dislodge accumulated dust. The cleaning interval, manual cleanup, and further configuration can be done using the **Fan Cleaner** page. The page is not visible on unsupported hardware to prevent unexpected behavior.

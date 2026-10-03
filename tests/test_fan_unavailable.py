@@ -645,12 +645,13 @@ class TestDaemonLifecycleAndReprobe(unittest.TestCase):
              patch("time.time", side_effect=_fake_time), \
              patch("time.sleep", side_effect=_fake_sleep), \
              patch.object(ctrl, "get_reference_temp", return_value=40.0), \
+             patch.object(ctrl, "set_fan_pwm") as mock_set_pwm, \
              patch.object(ctrl, "set_fan_mode") as mock_set_mode:
             runner = CliRunner()
             result = runner.invoke(serve)
             self.assertEqual(result.exit_code, 0)
             self.assertIn("resuming fan-control writes", result.output)
-            mock_set_mode.assert_called_with("auto")
+            self.assertTrue(mock_set_pwm.called or mock_set_mode.called)
 
 
 # ===========================================================================

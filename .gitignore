@@ -1,6 +1,7 @@
 dev
 tests/*
 !tests/test_fan_unavailable.py
+!tests/test_modes.py
 __pycache__
 **/__pycache__
 *.pyc

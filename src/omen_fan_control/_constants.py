@@ -31,6 +31,34 @@ VOLATILE_CONFIG_FILE = VOLATILE_CONFIG_DIR / "config.json"
 DEFAULT_CALIBRATION_WAIT = 30
 DEFAULT_WATCHDOG_INTERVAL = 90
 
+# Boards where temperature monitoring works but fan-control protocol is not
+# yet hardware-validated.  The kernel driver stub (fan_profile=NULL) skips
+# hwmon registration for these boards so no pwm* sysfs files appear.
+# check_board_support() tests this set BEFORE SUPPORTED_BOARDS, ensuring
+# 8CC0 is never returned as "SUPPORTED" despite appearing in that set.
+# write_sys_file() reads the live DMI board name (not cached config) so the
+# guard fires reliably even on first boot before the cache is populated.
+MONITORING_ONLY_BOARDS: set[str] = {
+    "8CC0",
+}
+
+# Default Auto curve: [temp_°C, fan_%].  These are the existing GUI curve
+# editor defaults, reused for the service when no user curve is saved.
+DEFAULT_AUTO_CURVE: list[list[float]] = [
+    [40, 20],
+    [55, 40],
+    [70, 65],
+    [85, 90],
+    [95, 100],
+]
+
+# Performance reuses the Auto curve's validated breakpoints and increases
+# each non-maximum target by 15 percentage points, capped at 100%.  It makes
+# no claim about physical RPM; the result is verified mathematically in tests.
+DEFAULT_PERFORMANCE_CURVE: list[list[float]] = [
+    [temp, min(percent + 15, 100)] for temp, percent in DEFAULT_AUTO_CURVE
+]
+
 _OMEN_FAN_CONTROL_DIR = os.environ.get("OMEN_FAN_CONTROL_DIR")
 if _OMEN_FAN_CONTROL_DIR:
     OMEN_FAN_DIR = Path(_OMEN_FAN_CONTROL_DIR) / "driver"

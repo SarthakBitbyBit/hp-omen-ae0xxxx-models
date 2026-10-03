@@ -5,11 +5,16 @@ import time
 
 import click
 
-from .._constants import VOLATILE_CONFIG_FILE
+from .._constants import (
+    DEFAULT_AUTO_CURVE,
+    DEFAULT_PERFORMANCE_CURVE,
+    VOLATILE_CONFIG_FILE,
+)
 from . import get_controller
 
-# Re-probe the hwmon interface at this interval when it is absent (seconds).
-_REPROBE_INTERVAL = 30
+# Bounded exponential backoff when the hwmon interface is absent (seconds).
+_REPROBE_INTERVALS: tuple[int, ...] = (30, 60, 120, 300)
+_POLL_INTERVAL = 5
 
 
 @click.command()
@@ -29,7 +34,7 @@ def serve() -> None:
     if not controller.fan_control_available:
         click.echo(
             "Fan control interface absent at startup — skipping fan writes. "
-            f"Will re-probe every {_REPROBE_INTERVAL}s."
+            f"Will re-probe with backoff {_REPROBE_INTERVALS}s."
         )
 
     ma_window = controller.config.get("ma_window", 5)
@@ -55,6 +60,7 @@ def serve() -> None:
 
     # Track re-probe timing and log-suppression for unavailable interface.
     last_reprobe_time: float = 0.0
+    reprobe_backoff_index = 0
     _logged_unavailable: bool = False
 
     while True:
@@ -123,9 +129,16 @@ def serve() -> None:
             # --- Re-probe hwmon when absent: deliberate interval, not every iteration ---
             if not controller.fan_control_available:
                 now = time.time()
-                if now - last_reprobe_time >= _REPROBE_INTERVAL:
+                reprobe_interval = _REPROBE_INTERVALS[reprobe_backoff_index]
+                if now - last_reprobe_time >= reprobe_interval:
                     controller._find_paths()
                     last_reprobe_time = now
+                    if controller.fan_control_available:
+                        reprobe_backoff_index = 0
+                    else:
+                        reprobe_backoff_index = min(
+                            reprobe_backoff_index + 1, len(_REPROBE_INTERVALS) - 1
+                        )
 
             if not controller.fan_control_available:
                 # Log once; suppress repeats until resolved.
@@ -133,16 +146,17 @@ def serve() -> None:
                     click.echo(
                         "Fan control interface absent — skipping fan writes. "
                         "Temperature monitoring continues. "
-                        f"Will re-probe every {_REPROBE_INTERVAL}s."
+                        f"Re-probe backoff: {_REPROBE_INTERVALS}s."
                     )
                     _logged_unavailable = True
-                time.sleep(2)
+                time.sleep(_POLL_INTERVAL)
                 continue
 
             # Interface is available. Reset suppression flag if it was set.
             if _logged_unavailable:
                 click.echo("Fan control interface detected — resuming fan-control writes.")
                 _logged_unavailable = False
+                reprobe_backoff_index = 0
 
             # --- Automatic fan cleaning (requires fan control) ---
             cleaner_enabled = controller.config.get("cleaner_enabled", False)
@@ -217,10 +231,30 @@ def serve() -> None:
             elif mode == "max":
                 controller.set_fan_mode("max")
 
-            elif mode == "auto":
-                controller.set_fan_mode("auto")
+            elif mode in ("auto", "performance"):
+                configured_curve = controller.config.get("curve", [])
+                if configured_curve:
+                    auto_curve = configured_curve
+                else:
+                    auto_curve = DEFAULT_AUTO_CURVE
 
-            time.sleep(2)
+                if mode == "performance":
+                    curve = controller.config.get("performance_curve") or DEFAULT_PERFORMANCE_CURVE
+                else:
+                    curve = auto_curve
+
+                if not controller.is_valid_curve(curve):
+                    click.echo(
+                        f"Invalid {mode} curve — skipping fan write; "
+                        "firmware automatic mode was not selected."
+                    )
+                else:
+                    target_cpu_pwm, target_gpu_pwm = controller.calculate_dual_target_pwm(
+                        int(avg_temp), gpu_temp, curve_override=curve
+                    )
+                    controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+
+            time.sleep(_POLL_INTERVAL)
 
         except KeyboardInterrupt:
             click.echo("Stopping daemon...")
