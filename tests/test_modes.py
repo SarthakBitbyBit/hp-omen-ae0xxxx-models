@@ -140,5 +140,147 @@ class TestModeEnablePaths(unittest.TestCase):
         write.assert_called_once_with(controller.pwm1_enable_path, 0)
 
 
+class TestServiceManager(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller = FanController.__new__(FanController)
+
+    def test_create_service_installs_unit_and_enables(self) -> None:
+        written_content: dict[str, str] = {}
+
+        def fake_write_text(content: str) -> None:
+            written_content["text"] = content
+
+        with (
+            patch("pathlib.Path.mkdir"),
+            patch("pathlib.Path.write_text", side_effect=fake_write_text),
+            patch("pathlib.Path.chmod"),
+            patch("omen_fan_control._service._restore_selinux_context"),
+            patch("subprocess.run") as mock_subp,
+        ):
+            success, msg = self.controller.create_service()
+            self.assertTrue(success)
+            self.assertIn("created and started", msg)
+            self.assertIn("ExecStart=", written_content["text"])
+            self.assertIn("omen_fan_control.cli serve", written_content["text"])
+            self.assertIn("Restart=on-failure", written_content["text"])
+            self.assertIn("User=root", written_content["text"])
+            self.assertIn("WantedBy=multi-user.target", written_content["text"])
+
+            commands = [call[0][0] for call in mock_subp.call_args_list]
+            self.assertIn(["systemctl", "daemon-reload"], commands)
+            self.assertIn(["systemctl", "enable", "omen-fan-control.service"], commands)
+            self.assertIn(["systemctl", "start", "omen-fan-control.service"], commands)
+
+    def test_remove_service_stops_disables_and_removes(self) -> None:
+        with (
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.unlink") as mock_unlink,
+            patch("subprocess.run") as mock_subp,
+        ):
+            success, msg = self.controller.remove_service()
+            self.assertTrue(success)
+            self.assertIn("removed", msg.lower())
+            mock_unlink.assert_called_once()
+
+            commands = [call[0][0] for call in mock_subp.call_args_list]
+            self.assertIn(["systemctl", "stop", "omen-fan-control.service"], commands)
+            self.assertIn(["systemctl", "disable", "omen-fan-control.service"], commands)
+            self.assertIn(["systemctl", "daemon-reload"], commands)
+
+    def test_is_service_installed_checks_multiple_systemd_paths(self) -> None:
+        with patch("pathlib.Path.exists", return_value=True):
+            self.assertTrue(FanController.is_service_installed())
+
+        def check_path(path_obj: Path) -> bool:
+            return "/usr/lib/systemd/system" in str(path_obj)
+
+        with patch("pathlib.Path.exists", autospec=True, side_effect=check_path):
+            self.assertTrue(FanController.is_service_installed())
+
+    def test_is_service_running_evaluates_systemctl_status(self) -> None:
+        mock_res = MagicMock()
+        mock_res.stdout = "active\n"
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertTrue(FanController.is_service_running())
+
+        mock_res.stdout = "inactive\n"
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertFalse(FanController.is_service_running())
+
+    def test_service_control_commands_call_systemctl(self) -> None:
+        with patch("subprocess.run") as mock_subp:
+            self.assertTrue(self.controller.start_service()[0])
+            self.assertTrue(self.controller.stop_service()[0])
+            self.assertTrue(self.controller.restart_service()[0])
+
+            commands = [call[0][0] for call in mock_subp.call_args_list]
+            self.assertIn(["systemctl", "start", "omen-fan-control.service"], commands)
+            self.assertIn(["systemctl", "stop", "omen-fan-control.service"], commands)
+            self.assertIn(["systemctl", "restart", "omen-fan-control.service"], commands)
+
+
+class TestDaemonServiceLifecycle(unittest.TestCase):
+    def test_daemon_handles_sigterm_gracefully(self) -> None:
+        import os
+        import signal
+        from click.testing import CliRunner
+        from omen_fan_control._cli.serve import serve
+
+        controller = FanController.__new__(FanController)
+        controller.config = {"mode": "auto", "ma_window": 5}
+        controller.config_path = Path("/mock/config.json")
+
+        def _raise_sigterm(seconds: float) -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        with (
+            patch("omen_fan_control._cli.serve.get_controller", return_value=controller),
+            patch("time.sleep", side_effect=_raise_sigterm),
+            patch.object(controller, "get_reference_temp", return_value=45.0),
+            patch.object(controller, "is_reverse_mode_active", return_value=False),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(serve)
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Stopping daemon...", result.output)
+
+    def test_daemon_picks_up_persisted_mode_change(self) -> None:
+        from click.testing import CliRunner
+        from omen_fan_control._cli.serve import serve
+
+        controller = FanController.__new__(FanController)
+        controller.config = {"mode": "auto", "ma_window": 5}
+        fake_config_path = MagicMock(spec=Path)
+        fake_config_path.exists.return_value = True
+        fake_config_path.stat.return_value.st_mtime = 100.0
+        controller.config_path = fake_config_path
+
+        iterations = 0
+
+        def _fake_sleep(seconds: float) -> None:
+            nonlocal iterations
+            iterations += 1
+            if iterations == 1:
+                # Update config to simulate user updating mode to performance
+                controller.config = {"mode": "performance", "ma_window": 5}
+                fake_config_path.stat.return_value.st_mtime = 200.0
+            elif iterations >= 2:
+                raise KeyboardInterrupt()
+
+        with (
+            patch("omen_fan_control._cli.serve.get_controller", return_value=controller),
+            patch("time.sleep", side_effect=_fake_sleep),
+            patch.object(controller, "get_reference_temp", return_value=50.0),
+            patch.object(controller, "is_reverse_mode_active", return_value=False),
+            patch.object(controller, "calculate_dual_target_pwm", return_value=(100, 100)),
+            patch.object(controller, "set_fan_pwm") as mock_set_pwm,
+            patch.object(FanController, "fan_control_available", new_callable=PropertyMock, return_value=True),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(serve)
+            self.assertEqual(result.exit_code, 0)
+            self.assertGreaterEqual(mock_set_pwm.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

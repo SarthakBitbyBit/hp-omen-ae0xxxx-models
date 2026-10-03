@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 import time
 
@@ -20,6 +21,14 @@ _POLL_INTERVAL = 5
 @click.command()
 def serve() -> None:
     """Run the fan control daemon (foreground). Used by systemd service."""
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt()
+
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+    except (ValueError, AttributeError):
+        pass
+
     controller = get_controller()
     click.echo("Starting Omen Fan Control Daemon...")
 
@@ -67,14 +76,20 @@ def serve() -> None:
         try:
             # --- Config reload (on-disk change detection) ---
             try:
-                current_mtime = controller.config_path.stat().st_mtime
-                current_v_mtime = 0.0
-                if VOLATILE_CONFIG_FILE.exists():
-                    current_v_mtime = VOLATILE_CONFIG_FILE.stat().st_mtime
+                current_mtime = (
+                    controller.config_path.stat().st_mtime
+                    if controller.config_path and controller.config_path.exists()
+                    else 0.0
+                )
+                current_v_mtime = (
+                    VOLATILE_CONFIG_FILE.stat().st_mtime
+                    if VOLATILE_CONFIG_FILE.exists()
+                    else 0.0
+                )
                 if current_mtime > last_config_mtime or current_v_mtime > last_volatile_mtime:
                     controller.config = controller.load_config()
-                    last_config_mtime = controller.config_path.stat().st_mtime if controller.config_path.exists() else 0
-                    last_volatile_mtime = VOLATILE_CONFIG_FILE.stat().st_mtime if VOLATILE_CONFIG_FILE.exists() else 0
+                    last_config_mtime = current_mtime
+                    last_volatile_mtime = current_v_mtime
                     print("Configuration reloaded from disk.")
             except Exception:
                 pass

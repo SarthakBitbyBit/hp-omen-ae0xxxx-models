@@ -45,6 +45,10 @@ WantedBy=multi-user.target
         try:
             service_path.parent.mkdir(parents=True, exist_ok=True)
             service_path.write_text(service_content)
+            try:
+                service_path.chmod(0o644)
+            except Exception:
+                pass
             _restore_selinux_context(service_path)
             subprocess.run(["systemctl", "daemon-reload"], check=True)
             subprocess.run(["systemctl", "enable", "omen-fan-control.service"], check=True)
@@ -60,7 +64,10 @@ WantedBy=multi-user.target
 
             service_path = Path("/etc/systemd/system/omen-fan-control.service")
             if service_path.exists():
-                subprocess.run(["rm", str(service_path)], check=True)
+                try:
+                    service_path.unlink()
+                except Exception:
+                    subprocess.run(["rm", "-f", str(service_path)], check=False)
 
             subprocess.run(["systemctl", "daemon-reload"], check=True)
             return True, "Service removed."
@@ -90,7 +97,14 @@ WantedBy=multi-user.target
 
     @staticmethod
     def is_service_installed() -> bool:
-        return Path("/etc/systemd/system/omen-fan-control.service").exists()
+        for p in (
+            Path("/etc/systemd/system/omen-fan-control.service"),
+            Path("/usr/lib/systemd/system/omen-fan-control.service"),
+            Path("/lib/systemd/system/omen-fan-control.service"),
+        ):
+            if p.exists():
+                return True
+        return False
 
     @staticmethod
     def is_service_running() -> bool:
