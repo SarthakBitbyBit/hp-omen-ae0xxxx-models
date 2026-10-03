@@ -22,6 +22,10 @@ This program also includes a modification that sets the max speed according to c
 
 * **OS:** Arch Linux 6.18, 6.19, 7.0, 7.1, 7.2; Ubuntu 24.04 (HWE 7.0)
 
+### Partial support — HP OMEN Gaming Laptop 16-ae0xxx (8CC0)
+
+Temperature monitoring is confirmed working on this board. **Manual fan control is not yet hardware-validated**: the board-specific WMI fan-control protocol has not been verified on `8CC0` hardware, so the tool will detect the board and display temperatures but will report fan-control commands as unavailable if the firmware does not respond as expected. Do not rely on fan speed management on this board without first confirming successful hardware validation and reporting it via an issue.
+
 > Would you like to add your model here? Create an issue with the "Tested Hardware" label and include these after successfully installing the patch and using the tool:
 > * Your laptop's board id (you can find it in /sys/class/dmi/id/board_name)
 > * Your kernel version (you can find it in /proc/version)
