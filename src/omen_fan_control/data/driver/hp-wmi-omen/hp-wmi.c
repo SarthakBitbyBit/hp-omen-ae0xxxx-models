@@ -37,6 +37,9 @@ static inline void _hp_mutex_cleanup(struct mutex **m)
 #include <linux/dmi.h>
 #include <linux/fixp-arith.h>
 #include <linux/hwmon.h>
+/* Disable multicolor LED support to avoid out-of-tree symbol dependencies on led_class_multicolor */
+#undef CONFIG_LEDS_CLASS_MULTICOLOR
+#undef CONFIG_LEDS_CLASS_MULTICOLOR_MODULE
 #if IS_ENABLED(CONFIG_LEDS_CLASS_MULTICOLOR)
 #include <linux/led-class-multicolor.h>
 #include <linux/leds.h>
@@ -230,6 +233,14 @@ MODULE_LICENSE("GPL");
 
 MODULE_ALIAS("wmi:95F24279-4D7B-4334-9387-ACCDC67EF61C");
 MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
+
+static bool experimental_telemetry;
+module_param(experimental_telemetry, bool, 0444);
+MODULE_PARM_DESC(experimental_telemetry, "Enable experimental read-only fan telemetry (query 0x2D) without fan control");
+
+static bool experimental_control;
+module_param(experimental_control, bool, 0444);
+MODULE_PARM_DESC(experimental_control, "Enable experimental fan control (query 0x27 Max Fan, query 0x2E Fan Speed)");
 
 #define HPWMI_EVENT_GUID "95F24279-4D7B-4334-9387-ACCDC67EF61C"
 #define HPWMI_BIOS_GUID "5FB7F034-2C63-45E9-BE91-3D44E2C707E4"
@@ -1623,10 +1634,327 @@ static DEVICE_ATTR_RW(postcode);
 static DEVICE_ATTR_RW(gpu_mux_mode);
 static DEVICE_ATTR_RO(keyboard_type);
 
+static ssize_t experimental_fan_telemetry_show(struct device *dev,
+					       struct device_attribute *attr, char *buf)
+{
+	u8 fan_data[128] = {0};
+	int ret;
+
+	if (!experimental_telemetry)
+		return -EOPNOTSUPP;
+
+	ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY, HPWMI_GM,
+				   &fan_data, sizeof(u8), sizeof(fan_data));
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	return sysfs_emit(buf, "cpu_rpm=%u\ngpu_rpm=%u\n",
+			  (unsigned int)fan_data[0] * 100,
+			  (unsigned int)fan_data[1] * 100);
+}
+static DEVICE_ATTR_RO(experimental_fan_telemetry);
+
+static ssize_t experimental_thermal_policy_version_show(struct device *dev,
+						       struct device_attribute *attr, char *buf)
+{
+	u8 data[8] = {0};
+	int ret;
+
+	if (!experimental_telemetry)
+		return -EOPNOTSUPP;
+
+	ret = hp_wmi_perform_query(HPWMI_GET_SYSTEM_DESIGN_DATA, HPWMI_GM,
+				   &data, sizeof(data), sizeof(data));
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	return sysfs_emit(buf, "thermal_policy_version=%u\nraw=0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",
+			  (unsigned int)data[3],
+			  data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+}
+static DEVICE_ATTR_RO(experimental_thermal_policy_version);
+
+static struct delayed_work experimental_max_dwork;
+static DEFINE_MUTEX(experimental_max_lock);
+static int experimental_max_state;
+
+static void experimental_max_keep_alive_handler(struct work_struct *work)
+{
+	u8 trigger_data[4] = {0};
+	int enabled = 1;
+	int ret;
+
+	guard(mutex)(&experimental_max_lock);
+
+	if (!experimental_control || experimental_max_state != 1)
+		return;
+
+	/* 1. Issue query 0x10 (user-define trigger / arm) */
+	ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
+				   trigger_data, sizeof(u8), sizeof(trigger_data));
+	if (ret) {
+		pr_warn_ratelimited("experimental keep-alive: query 0x10 failed: %d\n", ret);
+		return;
+	}
+
+	/* 2. Issue query 0x27 (Max fan ON) */
+	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, HPWMI_GM,
+				   &enabled, sizeof(enabled), 0);
+	if (ret) {
+		pr_warn_ratelimited("experimental keep-alive: query 0x27 failed: %d\n", ret);
+		return;
+	}
+
+	/* 3. Re-arm keep-alive for 90 seconds */
+	mod_delayed_work(system_dfl_wq, &experimental_max_dwork,
+			 msecs_to_jiffies(KEEP_ALIVE_DELAY_SECS * 1000));
+}
+
+static ssize_t experimental_fan_max_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	if (!experimental_control)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&experimental_max_lock);
+	return sysfs_emit(buf, "%d\n", experimental_max_state);
+}
+
+static ssize_t experimental_fan_max_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	u8 trigger_data[4] = {0};
+	int enabled, ret;
+	bool val;
+
+	if (!experimental_control)
+		return -EOPNOTSUPP;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&experimental_max_lock);
+
+	enabled = val ? 1 : 0;
+
+	if (enabled) {
+		/*
+		 * 1. Before 0x27(1), issue query 0x10 (user-define trigger):
+		 *    domain: HPWMI_GM (0x20008), insize: 1, payload: {0x00}, outsize: 4
+		 */
+		ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
+					   trigger_data, sizeof(u8), sizeof(trigger_data));
+		if (ret)
+			return ret < 0 ? ret : -EIO;
+
+		/*
+		 * 2. Only after successful 0x10, issue 0x27 (Max fan ON):
+		 *    domain: HPWMI_GM (0x20008), insize: 4, payload: {0x01,0x00,0x00,0x00}, outsize: 0
+		 */
+		ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, HPWMI_GM,
+					   &enabled, sizeof(enabled), 0);
+		if (ret)
+			return ret < 0 ? ret : -EIO;
+
+		experimental_max_state = 1;
+
+		/*
+		 * 3. Schedule 90-second keep-alive worker while experimental MAX is active.
+		 */
+		mod_delayed_work(system_dfl_wq, &experimental_max_dwork,
+				 msecs_to_jiffies(KEEP_ALIVE_DELAY_SECS * 1000));
+	} else {
+		/*
+		 * Clean MAX OFF path:
+		 * Verified sequence: 0x10 -> 0x27(0) -> 0x2E(0/0) -> cancel keep-alive
+		 */
+		u8 speed_reset[2] = {HP_FAN_SPEED_AUTOMATIC, HP_FAN_SPEED_AUTOMATIC};
+
+		/* 1. Query 0x10 (user-define trigger / re-arm for clean transition) */
+		ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
+					   trigger_data, sizeof(u8), sizeof(trigger_data));
+		if (ret)
+			return ret < 0 ? ret : -EIO;
+
+		/* 2. Query 0x27(0) (disable Max fan mode) */
+		ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, HPWMI_GM,
+					   &enabled, sizeof(enabled), 0);
+		if (ret)
+			return ret < 0 ? ret : -EIO;
+
+		/* 3. Query 0x2E({0x00, 0x00}) (restore auto EC fan curve) */
+		ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, HPWMI_GM,
+					   speed_reset, sizeof(speed_reset), 0);
+		if (ret)
+			return ret < 0 ? ret : -EIO;
+
+		/* 4. Cancel keep-alive worker */
+		cancel_delayed_work(&experimental_max_dwork);
+
+		experimental_max_state = 0;
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(experimental_fan_max);
+
+static DEFINE_MUTEX(experimental_perf_lock);
+static int experimental_perf_state;
+
+static ssize_t experimental_performance_mode_show(struct device *dev,
+						  struct device_attribute *attr, char *buf)
+{
+	if (!experimental_control)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&experimental_perf_lock);
+	return sysfs_emit(buf, "%d\n", experimental_perf_state);
+}
+
+static ssize_t experimental_performance_mode_store(struct device *dev,
+						   struct device_attribute *attr,
+						   const char *buf, size_t count)
+{
+	u8 trigger_data[4] = {0};
+	u8 perf_data[2];
+	int ret;
+	bool val;
+
+	if (!experimental_control)
+		return -EOPNOTSUPP;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&experimental_perf_lock);
+
+	/*
+	 * 1. Issue query 0x10 (user-define trigger / arm):
+	 *    domain: HPWMI_GM (0x20008), insize: 1, payload: {0x00}, outsize: 4
+	 */
+	ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
+				   trigger_data, sizeof(u8), sizeof(trigger_data));
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	/*
+	 * 2. Issue query 0x1A (HPWMI_SET_PERFORMANCE_MODE):
+	 *    domain: HPWMI_GM (0x20008), insize: 2, outsize: 0
+	 *    Performance ON (val=1):   payload: {0xFF, 0x31} (OMEN v1 Performance)
+	 *    Balanced/Default (val=0): payload: {0xFF, 0x30} (OMEN v1 Balanced)
+	 *    Board 8CC0 is confirmed OMEN v1 (version 1 from query 0x28).
+	 */
+	perf_data[0] = 0xFF;
+	perf_data[1] = val ? HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE : HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
+
+	ret = hp_wmi_perform_query(HPWMI_SET_PERFORMANCE_MODE, HPWMI_GM,
+				   perf_data, sizeof(perf_data), 0);
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	experimental_perf_state = val ? 1 : 0;
+
+	return count;
+}
+static DEVICE_ATTR_RW(experimental_performance_mode);
+
+static DEFINE_MUTEX(experimental_speed_lock);
+static u8 experimental_cpu_speed;
+static u8 experimental_gpu_speed;
+
+static ssize_t experimental_fan_speed_show(struct device *dev,
+					   struct device_attribute *attr, char *buf)
+{
+	if (!experimental_control)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&experimental_speed_lock);
+	return sysfs_emit(buf, "%u %u\n",
+			  (unsigned int)experimental_cpu_speed,
+			  (unsigned int)experimental_gpu_speed);
+}
+
+static ssize_t experimental_fan_speed_store(struct device *dev,
+					    struct device_attribute *attr,
+					    const char *buf, size_t count)
+{
+	u8 trigger_data[4] = {0};
+	u8 speed_data[2];
+	unsigned int cpu_val, gpu_val;
+	int max_off = 0;
+	int ret;
+
+	if (!experimental_control)
+		return -EOPNOTSUPP;
+
+	if (sscanf(buf, "%u %u", &cpu_val, &gpu_val) != 2)
+		return -EINVAL;
+
+	if (cpu_val > 100 || gpu_val > 100)
+		return -EINVAL;
+
+	guard(mutex)(&experimental_speed_lock);
+
+	/*
+	 * Stock hp-wmi fan-speed setter sequence:
+	 * 1. Query 0x10 (HPWMI_FAN_COUNT_GET_QUERY / user-define trigger):
+	 *    domain: HPWMI_GM (0x20008), insize: 1, payload: {0x00}, outsize: 4
+	 */
+	ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
+				   trigger_data, sizeof(u8), sizeof(trigger_data));
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	/*
+	 * 2. Query 0x27(0) (HPWMI_FAN_SPEED_MAX_SET_QUERY / disable Max):
+	 *    domain: HPWMI_GM (0x20008), insize: 4, payload: {0x00,0x00,0x00,0x00}, outsize: 0
+	 */
+	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, HPWMI_GM,
+				   &max_off, sizeof(max_off), 0);
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	/*
+	 * 3. Query 0x2E (HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY):
+	 *    domain: HPWMI_GM (0x20008), insize: 2, payload: {cpu, gpu}, outsize: 0
+	 */
+	speed_data[0] = (u8)cpu_val;
+	speed_data[1] = (u8)gpu_val;
+	ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, HPWMI_GM,
+				   speed_data, sizeof(speed_data), 0);
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
+	experimental_cpu_speed = (u8)cpu_val;
+	experimental_gpu_speed = (u8)gpu_val;
+
+	/*
+	 * Cancel MAX keep-alive worker and clear MAX state if active.
+	 */
+	scoped_guard(mutex, &experimental_max_lock) {
+		if (experimental_max_state == 1) {
+			cancel_delayed_work(&experimental_max_dwork);
+			experimental_max_state = 0;
+		}
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(experimental_fan_speed);
+
 static struct attribute *hp_wmi_attrs[] = {
 	&dev_attr_display.attr,	     &dev_attr_hddtemp.attr,	   &dev_attr_als.attr,
 	&dev_attr_dock.attr,	     &dev_attr_tablet.attr,	   &dev_attr_postcode.attr,
-	&dev_attr_gpu_mux_mode.attr, &dev_attr_keyboard_type.attr, NULL,
+	&dev_attr_gpu_mux_mode.attr, &dev_attr_keyboard_type.attr,
+	&dev_attr_experimental_fan_telemetry.attr,
+	&dev_attr_experimental_thermal_policy_version.attr,
+	&dev_attr_experimental_fan_max.attr,
+	&dev_attr_experimental_performance_mode.attr,
+	&dev_attr_experimental_fan_speed.attr,
+	NULL,
 };
 ATTRIBUTE_GROUPS(hp_wmi);
 
@@ -3341,6 +3669,8 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 	if (err && err != -ENODEV)
 		dev_info(&device->dev, "Lightbar setup returned %d\n", err);
 
+	INIT_DELAYED_WORK(&experimental_max_dwork, experimental_max_keep_alive_handler);
+
 	return 0;
 }
 
@@ -3372,6 +3702,8 @@ static int __exit hp_wmi_bios_remove(struct platform_device *device)
 	if (priv)
 		cancel_delayed_work_sync(&priv->keep_alive_dwork);
 
+	cancel_delayed_work_sync(&experimental_max_dwork);
+
 	return 0;
 }
 #else
@@ -3401,6 +3733,8 @@ static void __exit hp_wmi_bios_remove(struct platform_device *device)
 	priv = platform_get_drvdata(device);
 	if (priv)
 		cancel_delayed_work_sync(&priv->keep_alive_dwork);
+
+	cancel_delayed_work_sync(&experimental_max_dwork);
 }
 #endif
 

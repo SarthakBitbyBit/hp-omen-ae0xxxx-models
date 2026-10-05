@@ -14,8 +14,21 @@ from .logic import FanController
 from .fan_curve_widget import FanCurveEditor
 from .gui_widgets import ModernButton, NoFocusDelegate, CoreTempDialog, FanSpeedDialog, WorkerThread
 
+def check_root_execution() -> bool:
+    """Checks whether the GUI is being executed as root.
+    Returns True if running as root, False otherwise.
+    """
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
+        # Root Check: GUI is intended to run as a regular user
+        if check_root_execution():
+            raise RuntimeError(
+                "omen-fan-control-gui must not be run as root. "
+                "Privileged fan control operations are handled by omen-fan-control.service."
+            )
         super().__init__()
         self.setWindowTitle("HP Omen Fan Control")
         self.resize(900, 600)
@@ -146,30 +159,6 @@ class MainWindow(QMainWindow):
 
         self.update_cursors()
         self.center_window()
-
-        self.center_window()
-
-        # Root Check
-        if os.geteuid() != 0 and not self.controller.config.get("bypass_root_warning", False):
-            msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setWindowTitle("Root Privileges Required")
-            msg.setText("This application is not running as root.")
-            msg.setInformativeText("Most features (fan control, driver installation) require root privileges to function correctly.\n\nIt is recommended to run this application with 'sudo'.")
-            msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
-            msg.setDefaultButton(QMessageBox.StandardButton.Ok)
-            
-            chk = QCheckBox("Don't show this again")
-            msg.setCheckBox(chk)
-            
-            ret = msg.exec()
-            
-            if ret == QMessageBox.StandardButton.Ok:
-                if chk.isChecked():
-                    self.controller.config["bypass_root_warning"] = True
-                    self.controller.save_config()
-            else:
-                sys.exit(0)
 
         if not self.controller.config.get("bypass_patch_warning", False) or self.controller.config.get("debug_experimental_ui", False):
             support_status, board_name = self.controller.check_board_support()
@@ -2844,26 +2833,31 @@ class MainWindow(QMainWindow):
 def main():
     import signal
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    
+
+    # Refuse execution as root: the GUI is designed for regular user desktop sessions.
+    # Privileged fan operations are handled safely by the omen-fan-control systemd service.
+    if check_root_execution():
+        sys.stderr.write(
+            "Error: omen-fan-control-gui should not be run as root (or via sudo).\n\n"
+            "The GUI is intended to run as a regular desktop user to configure fan curves and monitor temperatures.\n"
+            "Hardware-privileged fan operations are handled safely by the background systemd service:\n"
+            "    sudo systemctl start omen-fan-control.service\n\n"
+            "Running graphical applications via sudo can contaminate home directory permissions and fails under\n"
+            "Wayland desktop sessions due to security boundaries and missing X11/xcb cursor libraries.\n"
+            "(If you ever require Qt X11 support for other tools, install 'libxcb-cursor0' via: sudo apt install libxcb-cursor0)\n\n"
+            "Please launch omen-fan-control-gui as your regular user.\n"
+        )
+        sys.exit(1)
+
     # Pre-flight Display Check
     if os.name == 'posix':
-        display = os.environ.get("DISPLAY")
+        display = os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
         if not display:
-            print("Error: No DISPLAY environment variable found.")
-            print("If you are running via SSH, ensure X11 forwarding is enabled (-X or -Y).")
-            print("If you are running via sudo, try 'sudo -E python3 -m omen_fan_control.gui' or 'pkexec python3 -m omen_fan_control.gui'.")
+            sys.stderr.write(
+                "Error: No graphical display environment found (neither WAYLAND_DISPLAY nor DISPLAY is set).\n"
+                "If running remotely via SSH, ensure X11 forwarding is enabled (-X or -Y).\n"
+            )
             sys.exit(1)
-        
-        # Check if we can actually connect to X (prevents obscure segments faults/Qt errors)
-        try:
-            from subprocess import run, DEVNULL
-            res = run(["xset", "q"], stdout=DEVNULL, stderr=DEVNULL)
-            if res.returncode != 0 and os.geteuid() == 0:
-                 print(f"Warning: Could not connect to display {display} as root.")
-                 print("This is likely a permission issue with Xauthority.")
-                 print("Fix: Use 'pkexec python3 -m omen_fan_control.gui' or 'sudo -E python3 -m omen_fan_control.gui'.")
-        except Exception:
-            pass
     
     app = QApplication(sys.argv)
     app.setStyle("Windows")

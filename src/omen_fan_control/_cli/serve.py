@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import signal
 import threading
 import time
@@ -8,7 +9,10 @@ import click
 
 from .._constants import (
     DEFAULT_AUTO_CURVE,
+    DEFAULT_MIN_REQUIRED_RPM,
     DEFAULT_PERFORMANCE_CURVE,
+    EXPERIMENTAL_FAN_SPEED_PATH,
+    MAX_RUNTIME_SAFETY_FLOOR,
     VOLATILE_CONFIG_FILE,
 )
 from . import get_controller
@@ -40,7 +44,16 @@ def serve() -> None:
     except Exception as e:
         click.echo(f"Startup reverse mode check failed: {e}")
 
-    if not controller.fan_control_available:
+    def _is_fan_control_ready() -> bool:
+        if hasattr(controller, "is_fan_control_ready"):
+            return controller.is_fan_control_ready()
+        if controller.get_board_name() == "8CC0":
+            if getattr(controller, "is_experimental_control_enabled", lambda: False)():
+                return EXPERIMENTAL_FAN_SPEED_PATH.exists()
+            return False
+        return controller.fan_control_available
+
+    if not _is_fan_control_ready():
         click.echo(
             "Fan control interface absent at startup — skipping fan writes. "
             f"Will re-probe with backoff {_REPROBE_INTERVALS}s."
@@ -71,6 +84,8 @@ def serve() -> None:
     last_reprobe_time: float = 0.0
     reprobe_backoff_index = 0
     _logged_unavailable: bool = False
+    consecutive_low_cpu: int = 0
+    consecutive_low_gpu: int = 0
 
     while True:
         try:
@@ -104,6 +119,24 @@ def serve() -> None:
 
             # --- Temperature monitoring: always runs, independent of fan-control availability ---
             current_temp = controller.get_reference_temp()
+
+            if (
+                current_temp is None
+                or math.isnan(current_temp)
+                or math.isinf(current_temp)
+                or current_temp <= 0
+                or current_temp > 115
+            ):
+                click.echo(
+                    f"Warning: Invalid or unavailable temperature ({current_temp}) — "
+                    "reverting to firmware AUTO mode for safety."
+                )
+                try:
+                    controller.restore_firmware_auto()
+                except Exception:
+                    pass
+                time.sleep(_POLL_INTERVAL)
+                continue
 
             # --- Active cleaner: temperature-safety monitoring continues even when hwmon absent,
             #     but fan writes inside stop_fan_cleaning are guarded by the controller itself. ---
@@ -142,20 +175,20 @@ def serve() -> None:
                 cleaner_temp_history.clear()
 
             # --- Re-probe hwmon when absent: deliberate interval, not every iteration ---
-            if not controller.fan_control_available:
+            if not _is_fan_control_ready():
                 now = time.time()
                 reprobe_interval = _REPROBE_INTERVALS[reprobe_backoff_index]
                 if now - last_reprobe_time >= reprobe_interval:
                     controller._find_paths()
                     last_reprobe_time = now
-                    if controller.fan_control_available:
+                    if _is_fan_control_ready():
                         reprobe_backoff_index = 0
                     else:
                         reprobe_backoff_index = min(
                             reprobe_backoff_index + 1, len(_REPROBE_INTERVALS) - 1
                         )
 
-            if not controller.fan_control_available:
+            if not _is_fan_control_ready():
                 # Log once; suppress repeats until resolved.
                 if not _logged_unavailable:
                     click.echo(
@@ -235,7 +268,11 @@ def serve() -> None:
                         hysteresis_start_time = None
                         should_apply = True
 
-                if should_apply:
+                if controller.get_board_name() == "8CC0" and getattr(controller, "is_experimental_control_enabled", lambda: False)():
+                    # Controller handles 8CC0 duplicate suppression and 60s watchdog refresh
+                    controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+                    hysteresis_start_time = None
+                elif should_apply:
                     controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
                     hysteresis_start_time = None
 
@@ -247,27 +284,121 @@ def serve() -> None:
                 controller.set_fan_mode("max")
 
             elif mode in ("auto", "performance"):
-                configured_curve = controller.config.get("curve", [])
-                if configured_curve:
-                    auto_curve = configured_curve
-                else:
-                    auto_curve = DEFAULT_AUTO_CURVE
+                if (
+                    mode == "auto"
+                    and controller.get_board_name() == "8CC0"
+                    and getattr(controller, "is_experimental_control_enabled", lambda: False)()
+                ):
+                    state, state_changed = controller.update_auto_thermal_state(avg_temp, gpu_temp)
+                    if state == "idle":
+                        if state_changed:
+                            click.echo(
+                                f"Auto thermal cooldown reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                "— releasing fans to firmware AUTO."
+                            )
+                            controller.restore_firmware_auto()
+                        # Suppress repeated fan writes while staying in idle
+                    else:
+                        if state_changed:
+                            click.echo(
+                                f"Auto thermal trigger reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                "— engaging software AUTO fan control."
+                            )
+                        auto_report = controller.calculate_auto_target(avg_temp, gpu_temp)
+                        target_cpu_level = auto_report["cpu_fan_level"]
+                        target_gpu_level = auto_report["gpu_fan_level"]
 
-                if mode == "performance":
-                    curve = controller.config.get("performance_curve") or DEFAULT_PERFORMANCE_CURVE
-                else:
-                    curve = auto_curve
+                        if getattr(controller, "is_experimental_telemetry_enabled", lambda: False)():
+                            telemetry = controller.read_experimental_fan_telemetry()
+                            if telemetry is not None:
+                                act_cpu, act_gpu = telemetry
+                                trim_cpu, trim_gpu = controller.apply_auto_rpm_feedback(
+                                    act_cpu, act_gpu, auto_report["target_cpu_rpm"], auto_report["target_gpu_rpm"]
+                                )
+                                if trim_cpu > 0:
+                                    target_cpu_level = min(100, target_cpu_level + trim_cpu)
+                                if trim_gpu > 0:
+                                    target_gpu_level = min(100, target_gpu_level + trim_gpu)
 
-                if not controller.is_valid_curve(curve):
-                    click.echo(
-                        f"Invalid {mode} curve — skipping fan write; "
-                        "firmware automatic mode was not selected."
-                    )
+                        controller.set_experimental_fan_speed(target_cpu_level, target_gpu_level)
                 else:
-                    target_cpu_pwm, target_gpu_pwm = controller.calculate_dual_target_pwm(
-                        int(avg_temp), gpu_temp, curve_override=curve
-                    )
-                    controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+                    configured_curve = controller.config.get("curve", [])
+                    if configured_curve:
+                        auto_curve = configured_curve
+                    else:
+                        auto_curve = DEFAULT_AUTO_CURVE
+
+                    if mode == "performance":
+                        curve = controller.config.get("performance_curve") or DEFAULT_PERFORMANCE_CURVE
+                    else:
+                        curve = auto_curve
+
+                    if not controller.is_valid_curve(curve):
+                        click.echo(
+                            f"Invalid {mode} curve — skipping fan write; "
+                            "firmware automatic mode was not selected."
+                        )
+                    else:
+                        target_cpu_pwm, target_gpu_pwm = controller.calculate_dual_target_pwm(
+                            int(avg_temp), gpu_temp, curve_override=curve
+                        )
+                        controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+
+            # --- Runtime Low-RPM Safety Monitor (8CC0 experimental control) ---
+            if (
+                mode in ("auto", "curve", "performance")
+                and controller.get_board_name() == "8CC0"
+                and getattr(controller, "is_experimental_control_enabled", lambda: False)()
+                and getattr(controller, "is_experimental_telemetry_enabled", lambda: False)()
+            ):
+                min_req_rpm = int(controller.config.get("min_required_rpm", DEFAULT_MIN_REQUIRED_RPM))
+                telemetry = controller.read_experimental_fan_telemetry()
+                if telemetry is not None:
+                    actual_cpu_rpm, actual_gpu_rpm = telemetry
+
+                    # Check CPU fan: only monitor when active level commanded
+                    if (controller._last_commanded_cpu_level or 0) > 0:
+                        if actual_cpu_rpm < min_req_rpm:
+                            consecutive_low_cpu += 1
+                            if consecutive_low_cpu >= 2:
+                                new_floor = controller.escalate_runtime_min_fan_floor("cpu", bump=2)
+                                click.echo(
+                                    f"Safety guard: CPU fan RPM ({actual_cpu_rpm}) persistently below "
+                                    f"{min_req_rpm} RPM. Escalated session floor to level {new_floor}."
+                                )
+                                consecutive_low_cpu = 0
+                                if "target_cpu_pwm" in locals() and "target_gpu_pwm" in locals():
+                                    controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+                                if new_floor >= MAX_RUNTIME_SAFETY_FLOOR and actual_cpu_rpm == 0:
+                                    click.echo(
+                                        "CRITICAL: CPU fan stalled at maximum safety ceiling. "
+                                        "Restoring native firmware AUTO control."
+                                    )
+                                    controller.restore_firmware_auto()
+                        else:
+                            consecutive_low_cpu = 0
+
+                    # Check GPU fan: only monitor when active level commanded
+                    if (controller._last_commanded_gpu_level or 0) > 0:
+                        if actual_gpu_rpm < min_req_rpm:
+                            consecutive_low_gpu += 1
+                            if consecutive_low_gpu >= 2:
+                                new_floor = controller.escalate_runtime_min_fan_floor("gpu", bump=2)
+                                click.echo(
+                                    f"Safety guard: GPU fan RPM ({actual_gpu_rpm}) persistently below "
+                                    f"{min_req_rpm} RPM. Escalated session floor to level {new_floor}."
+                                )
+                                consecutive_low_gpu = 0
+                                if "target_cpu_pwm" in locals() and "target_gpu_pwm" in locals():
+                                    controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+                                if new_floor >= MAX_RUNTIME_SAFETY_FLOOR and actual_gpu_rpm == 0:
+                                    click.echo(
+                                        "CRITICAL: GPU fan stalled at maximum safety ceiling. "
+                                        "Restoring native firmware AUTO control."
+                                    )
+                                    controller.restore_firmware_auto()
+                        else:
+                            consecutive_low_gpu = 0
 
             time.sleep(_POLL_INTERVAL)
 
@@ -276,4 +407,14 @@ def serve() -> None:
             break
         except Exception as e:
             click.echo(f"Error in daemon loop: {e}")
+            try:
+                controller.restore_firmware_auto()
+            except Exception:
+                pass
             time.sleep(5)
+
+    click.echo("Cleaning up: restoring firmware AUTO fan control...")
+    try:
+        controller.restore_firmware_auto()
+    except Exception as e:
+        click.echo(f"Warning during shutdown cleanup: {e}")

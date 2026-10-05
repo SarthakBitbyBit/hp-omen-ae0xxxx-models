@@ -66,11 +66,18 @@ def cli(ctx: click.Context, config: str | None, help_extra: bool) -> None:
             click.echo(click.style("Using this tool could potentially cause system instability.", fg="red"))
             click.echo("To bypass this warning, set 'bypass_patch_warning' to true in config or toggle in GUI.")
         elif status == "MONITORING_ONLY":
-            click.echo(click.style(
-                f"NOTE: Board '{board}' supports temperature monitoring only. "
-                "Fan-control protocol is not hardware-validated; fan writes are disabled.",
-                fg="yellow",
-            ))
+            if controller.is_experimental_control_enabled() or controller._read_module_param("experimental_control"):
+                click.echo(click.style(
+                    f"NOTE: Board '{board}' default is temperature monitoring only. "
+                    "Experimental fan control is enabled.",
+                    fg="yellow",
+                ))
+            else:
+                click.echo(click.style(
+                    f"NOTE: Board '{board}' supports temperature monitoring only. "
+                    "Fan-control protocol is not hardware-validated; fan writes are disabled.",
+                    fg="yellow",
+                ))
         elif status == "POSSIBLY_SUPPORTED" and not controller.config.get("enable_experimental", False):
             click.echo(click.style(f"NOTE: Your board '{board}' is valid for experimental support.", fg="yellow"))
             click.echo(click.style("Community patches suggest it uses the Omen thermal path.", fg="yellow"))
@@ -94,13 +101,14 @@ def main() -> None:
 
 # Register extracted subcommands into the cli group
 
-from .calibrate import calibrate  # noqa: E402
+from .calibrate import calibrate, calibrate_min  # noqa: E402
 from .fan_control import fan_control  # noqa: E402
 from .install_patch import install_patch  # noqa: E402
 from .serve import serve  # noqa: E402
 from .stress import stress  # noqa: E402
 
 cli.add_command(calibrate)
+cli.add_command(calibrate_min)
 cli.add_command(fan_control)
 cli.add_command(install_patch)
 cli.add_command(serve)

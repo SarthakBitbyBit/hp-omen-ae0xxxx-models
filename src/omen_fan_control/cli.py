@@ -31,8 +31,10 @@ from . import get_data_dir
 @click.option('--bypass-warning', '--bypass-patch-warning', 'bypass_patch_warning', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Bypass driver patch warning. No arg shows current.")
 @click.option('--curve-interpolation', type=click.Choice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
 @click.option('--enable-experimental', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
+@click.option('--experimental-control', 'enable_experimental_control', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental fan control (8CC0). No arg shows current.")
+@click.option('--experimental-telemetry', 'enable_experimental_telemetry', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental fan telemetry (8CC0). No arg shows current.")
 @click.option('--thermal-profile', type=click.Choice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
-def options(wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpolation, enable_experimental, thermal_profile):
+def options(wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpolation, enable_experimental, enable_experimental_control, enable_experimental_telemetry, thermal_profile):
     """
     Configure or view options.
     Run without arguments to view all current settings.
@@ -40,16 +42,18 @@ def options(wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpol
     Run with flag and value (e.g. --wait-time 10) to set value.
     """
     controller = get_controller()
-    
-    if all(x is None for x in [wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpolation, enable_experimental, thermal_profile]):
+
+    if all(x is None for x in [wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpolation, enable_experimental, enable_experimental_control, enable_experimental_telemetry, thermal_profile]):
         wt = controller.config.get('calibration_wait', 5)
         wd = controller.config.get('watchdog_interval', 90)
         mw = controller.config.get('ma_window', 5)
         bp = controller.config.get('bypass_patch_warning', False)
         ci = controller.config.get('curve_interpolation', 'smooth')
         ee = controller.config.get('enable_experimental', False)
+        exp_ctl = controller.config.get('enable_experimental_control', False)
+        exp_tlm = controller.config.get('enable_experimental_telemetry', False)
         tp = controller.config.get('thermal_profile', 'omen')
-        
+
         click.echo("Current Configuration:")
         click.echo(f"  Calibration Wait Time: {wt}s \t--wait-time")
         click.echo(f"  Watchdog Interval:     {wd}s \t--watchdog")
@@ -57,6 +61,8 @@ def options(wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpol
         click.echo(f"  Bypass Warning:        {'On' if bp else 'Off'} \t--bypass-warning")
         click.echo(f"  Curve Interpolation:   {ci} \t--curve-interpolation")
         click.echo(f"  Experimental Support:  {'On' if ee else 'Off'} \t--enable-experimental")
+        click.echo(f"  Experimental Control:  {'On' if exp_ctl else 'Off'} \t--experimental-control")
+        click.echo(f"  Experimental Telemetry:{'On' if exp_tlm else 'Off'} \t--experimental-telemetry")
         click.echo(f"  Thermal Profile:       {tp} \t--thermal-profile")
         return
 
@@ -114,6 +120,26 @@ def options(wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpol
              controller.config['enable_experimental'] = is_on
              changed = True
              click.echo(f"Experimental Support set to {'On' if is_on else 'Off'}")
+
+    if enable_experimental_control is not None:
+        if enable_experimental_control == 'show':
+             val = controller.config.get('enable_experimental_control', False)
+             click.echo(f"Current Experimental Control: {'On' if val else 'Off'}")
+        else:
+             is_on = (enable_experimental_control == 'on')
+             controller.config['enable_experimental_control'] = is_on
+             changed = True
+             click.echo(f"Experimental Control set to {'On' if is_on else 'Off'}")
+
+    if enable_experimental_telemetry is not None:
+        if enable_experimental_telemetry == 'show':
+             val = controller.config.get('enable_experimental_telemetry', False)
+             click.echo(f"Current Experimental Telemetry: {'On' if val else 'Off'}")
+        else:
+             is_on = (enable_experimental_telemetry == 'on')
+             controller.config['enable_experimental_telemetry'] = is_on
+             changed = True
+             click.echo(f"Experimental Telemetry set to {'On' if is_on else 'Off'}")
 
     if thermal_profile is not None:
         if thermal_profile == 'show':
@@ -383,11 +409,13 @@ def enable_bios():
 @click.option('--bypass-warning', '--bypass-patch-warning', 'bypass_patch_warning', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Bypass driver patch warning. No arg shows current.")
 @click.option('--curve-interpolation', type=click.Choice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
 @click.option('--enable-experimental', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
+@click.option('--experimental-control', 'enable_experimental_control', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental fan control (8CC0). No arg shows current.")
+@click.option('--experimental-telemetry', 'enable_experimental_telemetry', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental fan telemetry (8CC0). No arg shows current.")
 @click.option('--thermal-profile', type=click.Choice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
 @click.pass_context
-def settings(ctx, wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpolation, enable_experimental, thermal_profile):
+def settings(ctx, wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpolation, enable_experimental, enable_experimental_control, enable_experimental_telemetry, thermal_profile):
     """Alias for options"""
-    ctx.invoke(options, wait_time=wait_time, watchdog=watchdog, ma_window=ma_window, bypass_patch_warning=bypass_patch_warning, curve_interpolation=curve_interpolation, enable_experimental=enable_experimental, thermal_profile=thermal_profile)
+    ctx.invoke(options, wait_time=wait_time, watchdog=watchdog, ma_window=ma_window, bypass_patch_warning=bypass_patch_warning, curve_interpolation=curve_interpolation, enable_experimental=enable_experimental, enable_experimental_control=enable_experimental_control, enable_experimental_telemetry=enable_experimental_telemetry, thermal_profile=thermal_profile)
 
 @cli.command()
 def license():

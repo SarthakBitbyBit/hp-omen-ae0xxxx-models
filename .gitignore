@@ -2,6 +2,7 @@ dev
 tests/*
 !tests/test_fan_unavailable.py
 !tests/test_modes.py
+!tests/test_auto_mode.py
 __pycache__
 **/__pycache__
 *.pyc
@@ -12,3 +13,12 @@ omen_pp_compat.h
 *.pkg.tar.zst
 arch/**/pkg/
 arch/**/src/
+
+# Generated kernel-module build artifacts
+src/omen_fan_control/data/driver/hp-wmi-omen/.*.cmd
+src/omen_fan_control/data/driver/hp-wmi-omen/*.o
+src/omen_fan_control/data/driver/hp-wmi-omen/*.ko
+src/omen_fan_control/data/driver/hp-wmi-omen/*.mod
+src/omen_fan_control/data/driver/hp-wmi-omen/*.mod.c
+src/omen_fan_control/data/driver/hp-wmi-omen/Module.symvers
+src/omen_fan_control/data/driver/hp-wmi-omen/modules.order

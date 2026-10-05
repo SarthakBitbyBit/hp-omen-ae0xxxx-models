@@ -30,6 +30,8 @@ class ConfigDict(TypedDict, total=False):
     curve_interpolation: str
     bypass_root_warning: bool
     enable_experimental: bool
+    enable_experimental_control: bool
+    enable_experimental_telemetry: bool
     thermal_profile: str
     cached_board_name: str | None
     debug_experimental_ui: bool
@@ -89,6 +91,8 @@ DEFAULT_CONFIG: ConfigDict = {
     "curve_interpolation": "smooth",
     "bypass_root_warning": False,
     "enable_experimental": False,
+    "enable_experimental_control": False,
+    "enable_experimental_telemetry": False,
     "thermal_profile": "omen",
     "cached_board_name": None,
     "debug_experimental_ui": False,

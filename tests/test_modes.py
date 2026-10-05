@@ -274,6 +274,7 @@ class TestDaemonServiceLifecycle(unittest.TestCase):
             patch.object(controller, "is_reverse_mode_active", return_value=False),
             patch.object(controller, "calculate_dual_target_pwm", return_value=(100, 100)),
             patch.object(controller, "set_fan_pwm") as mock_set_pwm,
+            patch.object(controller, "get_board_name", return_value="8C78"),
             patch.object(FanController, "fan_control_available", new_callable=PropertyMock, return_value=True),
         ):
             runner = CliRunner()

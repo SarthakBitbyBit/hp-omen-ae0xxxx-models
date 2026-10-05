@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 
 HWMON_PATH_PATTERN = "/sys/devices/platform/hp-wmi/hwmon/*/"
@@ -31,6 +32,108 @@ VOLATILE_CONFIG_FILE = VOLATILE_CONFIG_DIR / "config.json"
 DEFAULT_CALIBRATION_WAIT = 30
 DEFAULT_WATCHDOG_INTERVAL = 90
 
+WMI_CMD_GM = 0x20008
+WMI_QUERY_FAN_COUNT = 0x10
+WMI_QUERY_SET_PERFORMANCE_MODE = 0x1A
+WMI_QUERY_GET_GPU_THERMAL_MODES = 0x21
+WMI_QUERY_SET_GPU_THERMAL_MODES = 0x22
+WMI_QUERY_FAN_SPEED_MAX_SET = 0x27
+WMI_QUERY_GET_SYSTEM_DESIGN_DATA = 0x28
+WMI_QUERY_FAN_SPEED_GET = 0x2D
+WMI_QUERY_FAN_SPEED_SET = 0x2E
+EXPERIMENTAL_MAX_KEEP_ALIVE_INTERVAL = 90
+EXPERIMENTAL_WATCHDOG_REFRESH_INTERVAL = 60.0
+MIN_SOFTWARE_AUTO_FAN_LEVEL = 5
+FIRMWARE_AUTO_FAN_LEVEL = 0
+DEFAULT_MIN_REQUIRED_RPM = 500
+DEFAULT_FALLBACK_MIN_FAN_LEVEL = 15
+DEFAULT_CALIBRATION_CANDIDATE_LEVELS: tuple[int, ...] = (10, 12, 14, 16, 18, 20, 22, 25, 28, 30, 35, 40)
+MAX_RUNTIME_SAFETY_FLOOR = 50
+EXPERIMENTAL_FAN_SPEED_PATH = Path("/sys/devices/platform/hp-wmi/experimental_fan_speed")
+EXPERIMENTAL_FAN_TELEMETRY_PATH = Path("/sys/devices/platform/hp-wmi/experimental_fan_telemetry")
+EXPERIMENTAL_CONTROL_MODULE_PARAM = Path("/sys/module/hp_wmi/parameters/experimental_control")
+EXPERIMENTAL_TELEMETRY_MODULE_PARAM = Path("/sys/module/hp_wmi/parameters/experimental_telemetry")
+
+# 8CC0 Windows OMEN Auto Mode Breakpoints & Hysteresis Constants
+AUTO_ACTIVATION_CPU_TEMP: float = 65.0
+AUTO_ACTIVATION_GPU_TEMP: float = 55.0
+AUTO_COOLDOWN_CPU_TEMP: float = 59.0
+AUTO_COOLDOWN_GPU_TEMP: float = 49.0
+ACTIVE_AUTO_MIN_RPM: int = 1800
+ACTIVE_AUTO_MIN_FAN_LEVEL: int = 18
+
+AUTO_CURVE_SOURCE_OBSERVED = "OBSERVED"
+AUTO_CURVE_SOURCE_DERIVED = "DERIVED"
+AUTO_CURVE_SOURCE_REVERSE_ENGINEERED = "REVERSE-ENGINEERED"
+AUTO_CURVE_SOURCE_ESTIMATED = "ESTIMATED"
+AUTO_CURVE_SOURCE_UNKNOWN = "UNKNOWN"
+
+# Explicit 5°C thermal breakpoints for 8CC0 software AUTO:
+# Breakpoints at: 65°C, 70°C, 75°C, 80°C, 85°C
+# Sources:
+#  65°C: CPU 1800 RPM (ESTIMATED), GPU 1800 RPM (ESTIMATED)
+#  70°C: CPU 2600 RPM (DERIVED), GPU 2700 RPM (DERIVED)
+#  75°C: CPU 3700 RPM (DERIVED), GPU 3900 RPM (DERIVED)
+#  80°C: CPU 4700 RPM (DERIVED), GPU 5000 RPM (DERIVED)
+#  85°C: CPU 5700 RPM (OBSERVED), GPU 6100 RPM (OBSERVED)
+AUTO_BREAKPOINTS_TABLE: tuple[dict[str, Any], ...] = (
+    {
+        "temp": 65.0,
+        "cpu_rpm": 1800,
+        "gpu_rpm": 1800,
+        "cpu_level": 18,
+        "gpu_level": 18,
+        "source_cpu": AUTO_CURVE_SOURCE_ESTIMATED,
+        "source_gpu": AUTO_CURVE_SOURCE_ESTIMATED,
+    },
+    {
+        "temp": 70.0,
+        "cpu_rpm": 2600,
+        "gpu_rpm": 2700,
+        "cpu_level": 26,
+        "gpu_level": 27,
+        "source_cpu": AUTO_CURVE_SOURCE_DERIVED,
+        "source_gpu": AUTO_CURVE_SOURCE_DERIVED,
+    },
+    {
+        "temp": 75.0,
+        "cpu_rpm": 3700,
+        "gpu_rpm": 3900,
+        "cpu_level": 37,
+        "gpu_level": 39,
+        "source_cpu": AUTO_CURVE_SOURCE_DERIVED,
+        "source_gpu": AUTO_CURVE_SOURCE_DERIVED,
+    },
+    {
+        "temp": 80.0,
+        "cpu_rpm": 4700,
+        "gpu_rpm": 5000,
+        "cpu_level": 47,
+        "gpu_level": 50,
+        "source_cpu": AUTO_CURVE_SOURCE_DERIVED,
+        "source_gpu": AUTO_CURVE_SOURCE_DERIVED,
+    },
+    {
+        "temp": 85.0,
+        "cpu_rpm": 5700,
+        "gpu_rpm": 6100,
+        "cpu_level": 57,
+        "gpu_level": 61,
+        "source_cpu": AUTO_CURVE_SOURCE_OBSERVED,
+        "source_gpu": AUTO_CURVE_SOURCE_OBSERVED,
+    },
+)
+
+# Thermal profile constants for OMEN v1 (modern OMEN)
+HP_OMEN_V1_THERMAL_PROFILE_DEFAULT = 0x30
+HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE = 0x31
+HP_OMEN_V1_THERMAL_PROFILE_COOL = 0x50
+
+# Thermal profile constants for OMEN v0 / Victus / Victus S
+HP_OMEN_V0_THERMAL_PROFILE_DEFAULT = 0x00
+HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE = 0x01
+HP_OMEN_V0_THERMAL_PROFILE_COOL = 0x02
+
 # Boards where temperature monitoring works but fan-control protocol is not
 # yet hardware-validated.  The kernel driver stub (fan_profile=NULL) skips
 # hwmon registration for these boards so no pwm* sysfs files appear.
@@ -39,6 +142,13 @@ DEFAULT_WATCHDOG_INTERVAL = 90
 # write_sys_file() reads the live DMI board name (not cached config) so the
 # guard fires reliably even on first boot before the cache is populated.
 MONITORING_ONLY_BOARDS: set[str] = {
+    "8CC0",
+}
+
+# Boards where fan RPM telemetry exposed by the kernel driver (e.g. hp-wmi)
+# is unsupported, unverified, or known to report incorrect/zero values despite
+# spinning physical fans (such as board 8CC0 on HP OMEN 16-ae0xxx).
+UNSUPPORTED_TELEMETRY_BOARDS: set[str] = {
     "8CC0",
 }
 
