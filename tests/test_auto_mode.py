@@ -19,6 +19,18 @@ from omen_fan_control._constants import (
     AUTO_CURVE_SOURCE_DERIVED,
     AUTO_CURVE_SOURCE_ESTIMATED,
     AUTO_CURVE_SOURCE_OBSERVED,
+    AUTO_EMERGENCY_CONFIRMATION_SEC,
+    AUTO_EMERGENCY_RECOVERY_TEMP,
+    AUTO_EMERGENCY_TEMP_THRESHOLD,
+    AUTO_MAX_FAN_LEVEL_CPU,
+    AUTO_MAX_FAN_LEVEL_GPU,
+    AUTO_STAGNATION_ACTIVATION_TEMP,
+    AUTO_STAGNATION_INITIAL_BOOST_LEVEL,
+    AUTO_STAGNATION_MIN_IMPROVEMENT_TEMP,
+    AUTO_STAGNATION_RECOVERY_TEMP,
+    AUTO_STAGNATION_STEP_BOOST_LEVEL,
+    AUTO_STAGNATION_STEP_INTERVAL_SEC,
+    AUTO_STAGNATION_WINDOW_SEC,
     EXPERIMENTAL_WATCHDOG_REFRESH_INTERVAL,
     FIRMWARE_AUTO_FAN_LEVEL,
     WMI_CMD_GM,
@@ -729,3 +741,527 @@ class TestAutoIntegrationBugFixesAndGating(BaseAutoTest):
         with patch("omen_fan_control.fan_controller.EXPERIMENTAL_FAN_SPEED_PATH", present_speed):
             assert ctrl_en.is_fan_control_ready() is True
 
+
+class TestAutoStagnationRecoveryBoost(BaseAutoTest):
+    """FEATURE 1: AUTO Thermal Recovery & Stagnation Boost (>= 77°C)."""
+
+    def test_below_77_no_recovery_boost(self) -> None:
+        """Temperatures below 77°C are not eligible for stagnation detection."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # At 76.0°C for 200 seconds, boost remains 0
+        b_cpu, b_gpu, changed = ctrl.update_auto_stagnation_state(cpu_temp=76.0, gpu_temp=60.0, now=0.0)
+        assert (b_cpu, b_gpu) == (0, 0)
+        assert not changed
+
+        b_cpu, b_gpu, changed = ctrl.update_auto_stagnation_state(cpu_temp=76.5, gpu_temp=65.0, now=200.0)
+        assert (b_cpu, b_gpu) == (0, 0)
+        assert not changed
+        assert ctrl.get_auto_stagnation_boost() == (0, 0)
+
+    def test_77_plus_temperature_falling_no_boost(self) -> None:
+        """When temperature is >= 77°C but meaningfully improving (>= 1°C), do not boost."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # t=0: 80.0°C starts window
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+
+        # t=60: 78.5°C (dropped by 1.5°C >= 1.0°C min improvement)
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=78.5, gpu_temp=None, now=60.0)
+        assert b_cpu == 0
+        assert not changed
+
+        # t=150: (elapsed from reset=90s < 120s)
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=78.0, gpu_temp=None, now=150.0)
+        assert b_cpu == 0
+        assert not changed
+
+    def test_77_plus_normal_cooling_no_boost(self) -> None:
+        """When normal cooling is actively driving temperature down, do not boost."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # Consistent cooling steps every 40s
+        ctrl.update_auto_stagnation_state(cpu_temp=82.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.8, gpu_temp=None, now=40.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=79.5, gpu_temp=None, now=80.0)
+        b_cpu, _, _ = ctrl.update_auto_stagnation_state(cpu_temp=78.0, gpu_temp=None, now=120.0)
+        assert b_cpu == 0
+
+    def test_temperature_stagnant_less_than_threshold_no_boost(self) -> None:
+        """Temperature stagnant for less than the 120s window does not boost."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        # 119 seconds elapsed (< 120.0s)
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=80.1, gpu_temp=None, now=119.0)
+        assert b_cpu == 0
+        assert not changed
+
+    def test_temperature_stagnant_for_threshold_boost_activates(self) -> None:
+        """Temperature stagnant for >= 120s activates initial recovery boost (+4)."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        # 120 seconds elapsed with temperature hovering around 80.0°C
+        b_cpu, b_gpu, changed = ctrl.update_auto_stagnation_state(cpu_temp=79.8, gpu_temp=None, now=120.0)
+        assert b_cpu == AUTO_STAGNATION_INITIAL_BOOST_LEVEL  # +4
+        assert b_gpu == 0
+        assert changed
+        assert ctrl.get_auto_stagnation_boost() == (4, 0)
+
+    def test_boost_increases_fan_level_incrementally(self) -> None:
+        """Continued stagnation after re-evaluation interval applies incremental step boost (+2)."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # t=0 to 120: triggers initial boost (+4)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        b_cpu, _, _ = ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=120.0)
+        assert b_cpu == 4
+
+        # t=155 (35s after boost >= 30s step interval): still stagnant -> increments to 6 (+2)
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=155.0)
+        assert b_cpu == 6
+        assert changed
+
+        # t=190 (35s later): still stagnant -> increments to 8 (+2)
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=190.0)
+        assert b_cpu == 8
+        assert changed
+
+    def test_boost_never_exceeds_auto_ceiling(self) -> None:
+        """Boost is strictly clamped to AUTO fan ceiling (57 CPU, 61 GPU)."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+        ctrl.update_auto_thermal_state(cpu_temp=85.0, gpu_temp=85.0)
+
+        # Force a large boost in controller state
+        ctrl._auto_stagnation_cpu["boost_level"] = 25
+        ctrl._auto_stagnation_gpu["boost_level"] = 25
+
+        report = ctrl.calculate_auto_target(cpu_temp=85.0, gpu_temp=85.0)
+        # Normal curve at 85°C is 57 CPU, 61 GPU.
+        # Adding 25 must NOT exceed 57 CPU and 61 GPU!
+        assert report["cpu_fan_level"] == AUTO_MAX_FAN_LEVEL_CPU  # 57
+        assert report["gpu_fan_level"] == AUTO_MAX_FAN_LEVEL_GPU  # 61
+
+    def test_boost_works_independently_for_cpu_and_gpu(self) -> None:
+        """CPU at 80°C (stagnant) boosts CPU fan only; GPU at 60°C is unaffected."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+        ctrl.update_auto_thermal_state(cpu_temp=80.0, gpu_temp=60.0)
+
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=60.0, now=0.0)
+        b_cpu, b_gpu, changed = ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=60.0, now=120.0)
+
+        assert b_cpu == 4
+        assert b_gpu == 0
+        assert changed
+
+        # In target report, CPU level has +4 applied, GPU has 0 boost applied
+        report = ctrl.calculate_auto_target(cpu_temp=80.0, gpu_temp=60.0, independent_fans=True)
+        # At 80°C normal CPU level is 47 -> 47 + 4 = 51
+        assert report["cpu_fan_level"] == 51
+        assert report["stagnation_boost_cpu"] == 4
+        assert report["stagnation_boost_gpu"] == 0
+
+    def test_recovery_band_removes_boost(self) -> None:
+        """When temperature reaches 74-75°C recovery band, boost is removed."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # Engage boost
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=120.0)
+        assert ctrl.get_auto_stagnation_boost()[0] == 4
+
+        # Temperature cools into hysteresis band (76.0°C): boost remains on!
+        b_cpu, _, _ = ctrl.update_auto_stagnation_state(cpu_temp=76.0, gpu_temp=None, now=140.0)
+        assert b_cpu == 4
+
+        # Temperature reaches recovery band (74.8°C <= 75.0°C): boost REMOVED!
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=74.8, gpu_temp=None, now=160.0)
+        assert b_cpu == 0
+        assert changed
+        assert ctrl.get_auto_stagnation_boost() == (0, 0)
+
+    def test_controller_returns_to_normal_curve_after_recovery(self) -> None:
+        """After recovery boost is removed, target returns to exact normal curve."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+        ctrl.update_auto_thermal_state(cpu_temp=75.0, gpu_temp=50.0)
+
+        # Baseline curve target at 75°C
+        baseline_report = ctrl.calculate_auto_target(cpu_temp=75.0, gpu_temp=50.0)
+        expected_cpu_level = baseline_report["cpu_fan_level"]
+
+        # Simulate stagnation, then recovery
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=120.0)
+        assert ctrl.get_auto_stagnation_boost()[0] > 0
+
+        # Cool to 74.5°C
+        ctrl.update_auto_stagnation_state(cpu_temp=74.5, gpu_temp=None, now=160.0)
+        assert ctrl.get_auto_stagnation_boost() == (0, 0)
+
+        # Re-check target at 75°C
+        new_report = ctrl.calculate_auto_target(cpu_temp=75.0, gpu_temp=50.0)
+        assert new_report["cpu_fan_level"] == expected_cpu_level
+
+    def test_boost_does_not_permanently_modify_curve(self) -> None:
+        """Stagnation boost does not modify the curve table or configured curve."""
+        ctrl = self._make_ctrl()
+        table_before = [dict(bp) for bp in ctrl.get_auto_curve_breakpoints()]
+
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=120.0)
+        ctrl.calculate_auto_target(cpu_temp=80.0, gpu_temp=None)
+
+        table_after = [dict(bp) for bp in ctrl.get_auto_curve_breakpoints()]
+        assert table_before == table_after
+
+    def test_boost_does_not_ratchet_indefinitely(self) -> None:
+        """Boost does not ratchet indefinitely and clears completely on cooldown."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # Simulate 10 incremental steps at 80°C
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=120.0)
+        for t in range(150, 450, 30):
+            ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=float(t))
+
+        # Must never exceed AUTO ceiling
+        b_cpu, _ = ctrl.get_auto_stagnation_boost()
+        assert b_cpu <= AUTO_MAX_FAN_LEVEL_CPU
+
+        # Cooldown resets boost to 0
+        ctrl.update_auto_stagnation_state(cpu_temp=74.0, gpu_temp=None, now=500.0)
+        assert ctrl.get_auto_stagnation_boost() == (0, 0)
+
+    def test_repeated_heating_stagnation_triggers_another_boost(self) -> None:
+        """After recovery, subsequent heating and stagnation legitimately triggers another boost."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # First cycle: 80°C -> boost -> cool to 74°C -> clear
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_stagnation_state(cpu_temp=80.0, gpu_temp=None, now=120.0)
+        assert ctrl.get_auto_stagnation_boost()[0] == 4
+
+        ctrl.update_auto_stagnation_state(cpu_temp=74.0, gpu_temp=None, now=160.0)
+        assert ctrl.get_auto_stagnation_boost() == (0, 0)
+
+        # Re-heating to 81°C starts a new window
+        ctrl.update_auto_stagnation_state(cpu_temp=81.0, gpu_temp=None, now=200.0)
+        assert ctrl.get_auto_stagnation_boost() == (0, 0)
+
+        # 120s later at t=320s, stagnation again -> boosts!
+        b_cpu, _, changed = ctrl.update_auto_stagnation_state(cpu_temp=81.0, gpu_temp=None, now=320.0)
+        assert b_cpu == 4
+        assert changed
+
+    def test_performance_max_manual_modes_unaffected(self) -> None:
+        """Performance, max, and manual modes do not use stagnation boost."""
+        ctrl = self._make_ctrl()
+        ctrl.config["mode"] = "performance"
+        pwm_c, pwm_g = ctrl.calculate_dual_target_pwm(cpu_temp=80, gpu_temp=80)
+        # Verify calculation completes normally and returns valid PWM
+        assert 0 <= pwm_c <= 255
+        assert 0 <= pwm_g <= 255
+
+        ctrl.config["mode"] = "manual"
+        ctrl.config["manual_pwm"] = 180
+        man_c, man_g = ctrl.get_dual_manual_pwm()
+        assert (man_c, man_g) == (180, 180)
+
+
+class TestAutoHighTemperatureSpikeSafetyBarrier(BaseAutoTest):
+    """FEATURE 2: AUTO High-Temperature Spike Safety Barrier (>= 85°C)."""
+
+    def test_84_celsius_no_emergency_state(self) -> None:
+        """Temperatures below 85°C do not trigger emergency state."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=84.0, gpu_temp=70.0, now=0.0)
+        assert state == "normal"
+        assert not changed
+        assert ctrl.get_auto_emergency_state() == "normal"
+
+    def test_single_85_celsius_sample_no_immediate_max(self) -> None:
+        """A single >= 85°C reading does not immediately command MAX (transitions to pending)."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=85.0, gpu_temp=None, now=0.0)
+        assert state == "pending"
+        assert changed
+        assert ctrl.get_auto_emergency_state() == "pending"
+        # Emergency MAX is NOT active during pending
+        assert not ctrl._auto_emergency_max_active
+
+    def test_94_celsius_transient_spike_no_max(self) -> None:
+        """A 94°C reading for 1-2s cancels pending state upon return to 60°C; never commands MAX."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # Spike at t=0
+        state, _ = ctrl.update_auto_emergency_state(cpu_temp=94.0, gpu_temp=None, now=0.0)
+        assert state == "pending"
+
+        # Falls back to 60°C at t=1.5s
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=60.0, gpu_temp=None, now=1.5)
+        assert state == "normal"
+        assert changed
+        assert not ctrl._auto_emergency_max_active
+
+    def test_transient_spike_clears_pending_cancelled(self) -> None:
+        """Transient high reading clears pending emergency state cleanly."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=0.0)
+        assert ctrl.get_auto_emergency_state() == "pending"
+
+        ctrl.update_auto_emergency_state(cpu_temp=78.0, gpu_temp=None, now=2.0)
+        assert ctrl.get_auto_emergency_state() == "normal"
+        assert ctrl._auto_emergency_pending_start is None
+
+    def test_sustained_85_celsius_activates_emergency_cooling(self) -> None:
+        """High temperature persisting for >= 3s activates emergency cooling state."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        # t=0: enters pending
+        ctrl.update_auto_emergency_state(cpu_temp=88.0, gpu_temp=None, now=0.0)
+
+        # t=3.5: persists >= 3.0s confirmation window -> enters active!
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=89.0, gpu_temp=None, now=3.5)
+        assert state == "active"
+        assert changed
+        assert ctrl._auto_emergency_max_active is True
+
+    def test_emergency_state_suppresses_duplicate_max_writes(self) -> None:
+        """Subsequent sustained calls while in active emergency report state_changed=False."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=0.0)
+        state1, changed1 = ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=3.5)
+        assert state1 == "active"
+        assert changed1 is True
+
+        # Subsequent cycles in emergency cooling: no duplicate write needed
+        state2, changed2 = ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=8.5)
+        assert state2 == "active"
+        assert changed2 is False
+
+        state3, changed3 = ctrl.update_auto_emergency_state(cpu_temp=89.0, gpu_temp=None, now=13.5)
+        assert state3 == "active"
+        assert changed3 is False
+
+    def test_emergency_state_has_recovery_hysteresis(self) -> None:
+        """Emergency cooling requires temperature to drop <= 80.0°C to recover."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=3.5)
+        assert ctrl.get_auto_emergency_state() == "active"
+
+        # Drops below 85°C to 83°C: still above 80.0°C recovery temp -> remains ACTIVE!
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=83.0, gpu_temp=None, now=8.5)
+        assert state == "active"
+        assert not changed
+
+    def test_recovery_returns_to_normal_auto(self) -> None:
+        """When temperature cools <= 80.0°C, emergency cooling state is cleared."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=3.5)
+
+        # Cooldown below 80.0°C (e.g. 78.5°C)
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=78.5, gpu_temp=None, now=12.0)
+        assert state == "normal"
+        assert changed
+        assert ctrl.get_auto_emergency_state() == "normal"
+        assert ctrl._auto_emergency_max_active is False
+
+    def test_invalid_missing_sensor_data_does_not_clear_emergency(self) -> None:
+        """Missing or NaN sensor data during active emergency does not falsely claim recovery."""
+        ctrl = self._make_ctrl()
+        ctrl.reset_auto_state()
+
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=0.0)
+        ctrl.update_auto_emergency_state(cpu_temp=90.0, gpu_temp=None, now=3.5)
+        assert ctrl.get_auto_emergency_state() == "active"
+
+        # None reading: must stay in active emergency
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=None, gpu_temp=None, now=8.0)
+        assert state == "active"
+        assert not changed
+
+        # NaN reading: must stay in active emergency
+        state, changed = ctrl.update_auto_emergency_state(cpu_temp=float("nan"), gpu_temp=None, now=12.0)
+        assert state == "active"
+        assert not changed
+
+    def test_performance_max_manual_modes_unaffected(self) -> None:
+        """Non-auto modes do not invoke or depend on auto emergency state."""
+        ctrl = self._make_ctrl()
+        ctrl.config["mode"] = "max"
+        assert ctrl.config.get("mode") == "max"
+        ctrl.reset_auto_state()
+        assert ctrl.get_auto_emergency_state() == "normal"
+
+
+class TestDaemonAutoNewFeaturesIntegration(BaseAutoTest):
+    """Daemon integration tests for spike barrier and stagnation boost."""
+
+    def test_daemon_transient_spike_does_not_command_max(self) -> None:
+        """Daemon handles 1-cycle spike without commanding MAX fan."""
+        ctrl = self._make_ctrl()
+        ctrl.config["mode"] = "auto"
+        ctrl.config["ma_window"] = 1
+
+        # Startup + Cycle 1: 94°C (pending) -> Cycle 2: 60°C (cleared)
+        temps = [60.0, 94.0, 60.0]
+        temp_idx = [0]
+        max_commands: list[bool] = []
+
+        def _get_temp() -> float:
+            idx = min(temp_idx[0], len(temps) - 1)
+            t = temps[idx]
+            temp_idx[0] += 1
+            return t
+
+        def _fake_sleep(sec: float) -> None:
+            if temp_idx[0] >= len(temps):
+                raise KeyboardInterrupt()
+
+        def _fake_set_max(enable: bool, **kwargs: object) -> bool:
+            max_commands.append(bool(enable))
+            return True
+
+        with (
+            patch("omen_fan_control._cli.serve.get_controller", return_value=ctrl),
+            patch.object(ctrl, "is_fan_control_ready", return_value=True),
+            patch.object(ctrl, "get_reference_temp", side_effect=_get_temp),
+            patch.object(ctrl, "get_gpu_temp", return_value=45.0),
+            patch("time.sleep", side_effect=_fake_sleep),
+            patch.object(ctrl, "set_experimental_fan_max", side_effect=_fake_set_max),
+            patch.object(ctrl, "set_experimental_fan_speed", return_value=True),
+            patch.object(ctrl, "restore_firmware_auto"),
+        ):
+            runner = CliRunner()
+            res = runner.invoke(serve)
+            assert res.exit_code == 0
+            # MAX was never commanded for transient 94°C spike!
+            assert len(max_commands) == 0
+
+    def test_daemon_sustained_high_temp_commands_max_and_recovers(self) -> None:
+        """Daemon commands MAX fan on sustained high temp and recovers when cooled."""
+        ctrl = self._make_ctrl()
+        ctrl.config["mode"] = "auto"
+        ctrl.config["ma_window"] = 1
+
+        # Startup: 60°C
+        # Cycle 1: 90°C (pending, t=0s)
+        # Cycle 2: 90°C (confirmed -> MAX ON, t=5s >= 3.0s confirm_sec)
+        # Cycle 3: 90°C (duplicate -> suppressed, t=10s)
+        # Cycle 4: 75°C (recovered -> MAX OFF, t=15s <= 80.0°C recovery)
+        temps = [60.0, 90.0, 90.0, 90.0, 75.0]
+        temp_idx = [0]
+        mono_time = [0.0]
+        max_commands: list[bool] = []
+
+        def _get_temp() -> float:
+            idx = min(temp_idx[0], len(temps) - 1)
+            t = temps[idx]
+            temp_idx[0] += 1
+            return t
+
+        def _fake_sleep(sec: float) -> None:
+            mono_time[0] += 5.0
+            if temp_idx[0] >= len(temps):
+                raise KeyboardInterrupt()
+
+        def _fake_set_max(enable: bool, **kwargs: object) -> bool:
+            max_commands.append(bool(enable))
+            return True
+
+        with (
+            patch("omen_fan_control._cli.serve.get_controller", return_value=ctrl),
+            patch.object(ctrl, "is_fan_control_ready", return_value=True),
+            patch.object(ctrl, "get_reference_temp", side_effect=_get_temp),
+            patch.object(ctrl, "get_gpu_temp", return_value=45.0),
+            patch("time.sleep", side_effect=_fake_sleep),
+            patch("time.monotonic", side_effect=lambda: mono_time[0]),
+            patch("omen_fan_control.fan_controller.time.monotonic", side_effect=lambda: mono_time[0]),
+            patch.object(ctrl, "set_experimental_fan_max", side_effect=_fake_set_max),
+            patch.object(ctrl, "set_experimental_fan_speed", return_value=True),
+            patch.object(ctrl, "restore_firmware_auto"),
+        ):
+            runner = CliRunner()
+            res = runner.invoke(serve)
+            assert res.exit_code == 0
+            # Commanded MAX True once, then recovered MAX False
+            assert max_commands == [True, False]
+            assert "Emergency high-temperature detected" in res.output
+            assert "Emergency cooling recovered" in res.output
+
+    def test_daemon_stagnation_boost_integration(self) -> None:
+        """Daemon detects stagnation and logs/applies stagnation boost."""
+        ctrl = self._make_ctrl()
+        ctrl.config["mode"] = "auto"
+        ctrl.config["ma_window"] = 1
+
+        # Startup: 60°C
+        # Cycle 1: 80°C (t=0s, normal curve)
+        # Cycle 2: 80°C (t=125s, stagnant >= 120s -> boost +4)
+        temps = [60.0, 80.0, 80.0]
+        temp_idx = [0]
+        mono_time = [0.0]
+        commanded_speeds: list[tuple[int, int]] = []
+
+        def _get_temp() -> float:
+            idx = min(temp_idx[0], len(temps) - 1)
+            t = temps[idx]
+            temp_idx[0] += 1
+            return t
+
+        def _fake_sleep(sec: float) -> None:
+            mono_time[0] += 125.0
+            if temp_idx[0] >= len(temps):
+                raise KeyboardInterrupt()
+
+        def _fake_set_speed(c_spd: int, g_spd: int, **kwargs: object) -> bool:
+            commanded_speeds.append((c_spd, g_spd))
+            return True
+
+        with (
+            patch("omen_fan_control._cli.serve.get_controller", return_value=ctrl),
+            patch.object(ctrl, "is_fan_control_ready", return_value=True),
+            patch.object(ctrl, "get_reference_temp", side_effect=_get_temp),
+            patch.object(ctrl, "get_gpu_temp", return_value=50.0),
+            patch("time.sleep", side_effect=_fake_sleep),
+            patch("time.monotonic", side_effect=lambda: mono_time[0]),
+            patch("omen_fan_control.fan_controller.time.monotonic", side_effect=lambda: mono_time[0]),
+            patch.object(ctrl, "set_experimental_fan_speed", side_effect=_fake_set_speed),
+            patch.object(ctrl, "restore_firmware_auto"),
+        ):
+            runner = CliRunner()
+            res = runner.invoke(serve)
+            assert res.exit_code == 0
+            assert "Auto thermal stagnation boost engaged" in res.output
+            assert len(commanded_speeds) >= 2
+            # Second cycle speed reflects +4 boost over first cycle
+            assert commanded_speeds[1][0] == commanded_speeds[0][0] + 4

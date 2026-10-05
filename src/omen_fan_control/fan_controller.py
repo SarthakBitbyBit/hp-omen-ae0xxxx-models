@@ -54,6 +54,19 @@ from ._constants import (
     ACTIVE_AUTO_MIN_RPM,
     ACTIVE_AUTO_MIN_FAN_LEVEL,
     AUTO_BREAKPOINTS_TABLE,
+    AUTO_EMERGENCY_CONFIRMATION_SEC,
+    AUTO_EMERGENCY_RECOVERY_TEMP,
+    AUTO_EMERGENCY_TEMP_THRESHOLD,
+    AUTO_MAX_FAN_LEVEL,
+    AUTO_MAX_FAN_LEVEL_CPU,
+    AUTO_MAX_FAN_LEVEL_GPU,
+    AUTO_STAGNATION_ACTIVATION_TEMP,
+    AUTO_STAGNATION_INITIAL_BOOST_LEVEL,
+    AUTO_STAGNATION_MIN_IMPROVEMENT_TEMP,
+    AUTO_STAGNATION_RECOVERY_TEMP,
+    AUTO_STAGNATION_STEP_BOOST_LEVEL,
+    AUTO_STAGNATION_STEP_INTERVAL_SEC,
+    AUTO_STAGNATION_WINDOW_SEC,
 )
 from ._driver import DriverInstallerMixin
 from ._service import ServiceManagerMixin
@@ -85,6 +98,9 @@ class FanController(
     _consecutive_rpm_shortfall_gpu: int = 0
     _rpm_feedback_trim_cpu: int = 0
     _rpm_feedback_trim_gpu: int = 0
+    _auto_emergency_state: str = "normal"
+    _auto_emergency_pending_start: float | None = None
+    _auto_emergency_max_active: bool = False
 
     def __init__(self, config_path: str | Path | None = None) -> None:
         self._find_paths()
@@ -94,6 +110,11 @@ class FanController(
             self.config_path = CONFIG_FILE
 
         self.config = self.load_config()
+
+        self._auto_emergency_state = "normal"
+        self._auto_emergency_pending_start = None
+        self._auto_emergency_max_active = False
+        self.reset_auto_stagnation_state()
 
         if self.config.get("cleaner_in_progress", False):
             start_ts = self.config.get("cleaner_start_time", 0)
@@ -1708,6 +1729,7 @@ class FanController(
                 self._consecutive_rpm_shortfall_gpu = 0
                 self._rpm_feedback_trim_cpu = 0
                 self._rpm_feedback_trim_gpu = 0
+                self.reset_auto_stagnation_state()
                 return "idle", True
             return "active", False
 
@@ -1729,6 +1751,9 @@ class FanController(
           - actual_cpu_rpm: measured 0x2D CPU RPM if telemetry available
           - actual_gpu_rpm: measured 0x2D GPU RPM if telemetry available
           - thermal_state: 'idle' or 'active'
+          - stagnation_boost_cpu: active stagnation boost added to CPU level
+          - stagnation_boost_gpu: active stagnation boost added to GPU level
+          - emergency_state: 'normal', 'pending', or 'active'
         """
         state = self.get_auto_thermal_state()
         has_gpu = (gpu_temp is not None and gpu_temp > 0)
@@ -1743,11 +1768,15 @@ class FanController(
         else:
             target_cpu_rpm, target_gpu_rpm, interval = self.interpolate_auto_curve(effective_temp)
 
+        boost_cpu, boost_gpu = self.get_auto_stagnation_boost()
+
         if state == "idle":
             target_cpu_rpm = 0
             target_gpu_rpm = 0
             cpu_level = FIRMWARE_AUTO_FAN_LEVEL
             gpu_level = FIRMWARE_AUTO_FAN_LEVEL
+            boost_cpu = 0
+            boost_gpu = 0
         else:
             raw_cpu_level = self.rpm_to_fan_level(target_cpu_rpm)
             raw_gpu_level = self.rpm_to_fan_level(target_gpu_rpm)
@@ -1756,6 +1785,14 @@ class FanController(
             active_gpu_floor = max(gpu_floor, ACTIVE_AUTO_MIN_FAN_LEVEL)
             cpu_level = self.clamp_software_auto_fan_level(raw_cpu_level, min_floor=active_cpu_floor)
             gpu_level = self.clamp_software_auto_fan_level(raw_gpu_level, min_floor=active_gpu_floor)
+
+            # Apply stagnation recovery boost (strictly bounded by AUTO fan ceiling)
+            if boost_cpu > 0:
+                cpu_ceiling = int(self.config.get("auto_max_fan_level_cpu", AUTO_MAX_FAN_LEVEL_CPU))
+                cpu_level = min(cpu_ceiling, cpu_level + boost_cpu)
+            if boost_gpu > 0:
+                gpu_ceiling = int(self.config.get("auto_max_fan_level_gpu", AUTO_MAX_FAN_LEVEL_GPU))
+                gpu_level = min(gpu_ceiling, gpu_level + boost_gpu)
 
         actual_cpu_rpm = None
         actual_gpu_rpm = None
@@ -1774,7 +1811,231 @@ class FanController(
             "actual_cpu_rpm": actual_cpu_rpm,
             "actual_gpu_rpm": actual_gpu_rpm,
             "thermal_state": state,
+            "stagnation_boost_cpu": boost_cpu,
+            "stagnation_boost_gpu": boost_gpu,
+            "emergency_state": self.get_auto_emergency_state(),
         }
+
+    def get_auto_emergency_state(self) -> str:
+        """Return current AUTO emergency cooling state: 'normal', 'pending', or 'active'."""
+        return getattr(self, "_auto_emergency_state", "normal")
+
+    def reset_auto_emergency_state(self) -> None:
+        """Reset AUTO emergency cooling state machine."""
+        self._auto_emergency_state = "normal"
+        self._auto_emergency_pending_start = None
+        self._auto_emergency_max_active = False
+
+    def update_auto_emergency_state(
+        self,
+        cpu_temp: float | None,
+        gpu_temp: float | None = None,
+        now: float | None = None,
+    ) -> tuple[str, bool]:
+        """Evaluate high-temperature spike barrier and emergency MAX cooling.
+
+        Prevents transient (1-2s) sensor spikes from immediately commanding MAX.
+        Requires persistence >= confirmation_sec (default 3.0s) before escalating.
+        Once active, remains in emergency cooling until temperature recovers below
+        recovery_temp (default 80.0°C) to prevent MAX -> idle oscillation.
+
+        Returns (new_emergency_state, state_changed).
+        """
+        current_state = self.get_auto_emergency_state()
+        cur_time = time.monotonic() if now is None else float(now)
+
+        # Handle sensor robustness: invalid / missing readings must never be interpreted
+        # as proof that temperatures are safe when in emergency cooling.
+        if (
+            cpu_temp is None
+            or math.isnan(cpu_temp)
+            or math.isinf(cpu_temp)
+            or cpu_temp <= 0
+        ):
+            if current_state == "active":
+                return "active", False
+            return current_state, False
+
+        threshold = float(self.config.get("auto_emergency_temp_threshold", AUTO_EMERGENCY_TEMP_THRESHOLD))
+        recovery_temp = float(self.config.get("auto_emergency_recovery_temp", AUTO_EMERGENCY_RECOVERY_TEMP))
+        confirm_sec = float(self.config.get("auto_emergency_confirmation_sec", AUTO_EMERGENCY_CONFIRMATION_SEC))
+
+        has_gpu = (gpu_temp is not None and not math.isnan(gpu_temp) and not math.isinf(gpu_temp) and gpu_temp > 0)
+        is_high = (cpu_temp >= threshold) or (has_gpu and gpu_temp >= threshold)
+
+        if current_state == "normal":
+            if is_high:
+                self._auto_emergency_state = "pending"
+                self._auto_emergency_pending_start = cur_time
+                return "pending", True
+            return "normal", False
+
+        elif current_state == "pending":
+            if is_high:
+                start = self._auto_emergency_pending_start if self._auto_emergency_pending_start is not None else cur_time
+                elapsed = cur_time - start
+                if elapsed >= confirm_sec:
+                    self._auto_emergency_state = "active"
+                    self._auto_emergency_max_active = True
+                    return "active", True
+                return "pending", False
+            else:
+                # Transient spike cleared before confirmation period!
+                self._auto_emergency_state = "normal"
+                self._auto_emergency_pending_start = None
+                return "normal", True
+
+        else:  # active
+            # Recovery requires temperatures to fall below recovery threshold
+            recovered = (cpu_temp <= recovery_temp) and (not has_gpu or gpu_temp <= recovery_temp)
+            if recovered:
+                self._auto_emergency_state = "normal"
+                self._auto_emergency_pending_start = None
+                self._auto_emergency_max_active = False
+                return "normal", True
+            return "active", False
+
+    def get_auto_stagnation_boost(self) -> tuple[int, int]:
+        """Return current (cpu_boost, gpu_boost) fan levels."""
+        cpu_data = getattr(self, "_auto_stagnation_cpu", None)
+        gpu_data = getattr(self, "_auto_stagnation_gpu", None)
+        cpu_boost = int(cpu_data.get("boost_level", 0)) if isinstance(cpu_data, dict) else 0
+        gpu_boost = int(gpu_data.get("boost_level", 0)) if isinstance(gpu_data, dict) else 0
+        return cpu_boost, gpu_boost
+
+    def reset_auto_stagnation_state(self) -> None:
+        """Reset AUTO stagnation tracking and boost levels."""
+        self._auto_stagnation_cpu = {
+            "start_time": None,
+            "baseline_temp": None,
+            "boost_level": 0,
+            "last_boost_time": None,
+        }
+        self._auto_stagnation_gpu = {
+            "start_time": None,
+            "baseline_temp": None,
+            "boost_level": 0,
+            "last_boost_time": None,
+        }
+
+    def update_auto_stagnation_state(
+        self,
+        cpu_temp: float | None,
+        gpu_temp: float | None = None,
+        now: float | None = None,
+    ) -> tuple[int, int, bool]:
+        """Evaluate thermal stagnation and compute incremental recovery boost.
+
+        Monitors whether temperature is stagnant (fails to improve by >= min_imp
+        over window_sec) at or above activation_temp (>= 77°C).
+        Applies incremental boost (+3..+5 initial, +2 additional if stagnant),
+        bounded by AUTO ceiling.
+        Removes boost when temperature cools into recovery band (<= 75°C).
+
+        Returns (cpu_boost, gpu_boost, state_changed).
+        """
+        cur_time = time.monotonic() if now is None else float(now)
+
+        act_temp = float(self.config.get("auto_stagnation_activation_temp", AUTO_STAGNATION_ACTIVATION_TEMP))
+        rec_temp = float(self.config.get("auto_stagnation_recovery_temp", AUTO_STAGNATION_RECOVERY_TEMP))
+        win_sec = float(self.config.get("auto_stagnation_window_sec", AUTO_STAGNATION_WINDOW_SEC))
+        min_imp = float(self.config.get("auto_stagnation_min_improvement_temp", AUTO_STAGNATION_MIN_IMPROVEMENT_TEMP))
+        init_boost = int(self.config.get("auto_stagnation_initial_boost", AUTO_STAGNATION_INITIAL_BOOST_LEVEL))
+        step_boost = int(self.config.get("auto_stagnation_step_boost", AUTO_STAGNATION_STEP_BOOST_LEVEL))
+        step_interval = float(self.config.get("auto_stagnation_step_interval_sec", AUTO_STAGNATION_STEP_INTERVAL_SEC))
+
+        if not hasattr(self, "_auto_stagnation_cpu") or not isinstance(self._auto_stagnation_cpu, dict):
+            self.reset_auto_stagnation_state()
+
+        def _update_domain(data: dict[str, Any], temp: float | None, ceiling: int) -> bool:
+            if temp is None or math.isnan(temp) or math.isinf(temp) or temp <= 0:
+                return False
+
+            prev_boost = data.get("boost_level", 0)
+
+            # Case 1: Boost is currently ACTIVE (> 0)
+            if prev_boost > 0:
+                # Recovery condition: temp reached <= recovery band (74-75°C)
+                if temp <= rec_temp:
+                    data["boost_level"] = 0
+                    data["start_time"] = None
+                    data["baseline_temp"] = None
+                    data["last_boost_time"] = None
+                    return True
+
+                # Hysteresis band: rec_temp < temp < act_temp (75°C to 77°C)
+                if temp < act_temp:
+                    # Temperature is cooling down; maintain existing boost
+                    return False
+
+                # temp >= act_temp (>= 77°C): still hot despite boost
+                baseline = data.get("baseline_temp")
+                if baseline is not None and (baseline - temp) >= min_imp:
+                    # Meaningfully decreasing (improving by >= 1°C)!
+                    data["baseline_temp"] = temp
+                    data["start_time"] = cur_time
+                    return False
+                else:
+                    # Stagnant despite boost. Check if step_interval elapsed since last boost
+                    last_b = data.get("last_boost_time")
+                    if last_b is not None and (cur_time - last_b) >= step_interval:
+                        new_boost = min(ceiling, prev_boost + step_boost)
+                        if new_boost != prev_boost:
+                            data["boost_level"] = new_boost
+                            data["last_boost_time"] = cur_time
+                            data["baseline_temp"] = temp
+                            data["start_time"] = cur_time
+                            return True
+                    return False
+
+            # Case 2: Boost is NOT currently active (== 0)
+            else:
+                if temp < act_temp:
+                    # Below 77°C: not eligible for stagnation detection
+                    data["start_time"] = None
+                    data["baseline_temp"] = None
+                    return False
+
+                # temp >= act_temp (>= 77°C)
+                if data.get("start_time") is None:
+                    # Start stagnation observation window
+                    data["start_time"] = cur_time
+                    data["baseline_temp"] = temp
+                    return False
+
+                baseline = data.get("baseline_temp")
+                if baseline is not None and (baseline - temp) >= min_imp:
+                    # Meaningfully decreasing (cooling working normally)
+                    data["baseline_temp"] = temp
+                    data["start_time"] = cur_time
+                    return False
+
+                # If temperature rose above baseline, update baseline so we measure future drop from peak
+                if baseline is not None and temp > baseline:
+                    data["baseline_temp"] = temp
+
+                elapsed = cur_time - data["start_time"]
+                if elapsed >= win_sec:
+                    # Stagnation duration threshold met!
+                    data["boost_level"] = min(ceiling, init_boost)
+                    data["last_boost_time"] = cur_time
+                    data["baseline_temp"] = temp
+                    data["start_time"] = cur_time
+                    return True
+
+                return False
+
+        cpu_ceil = int(self.config.get("auto_max_fan_level_cpu", AUTO_MAX_FAN_LEVEL_CPU))
+        gpu_ceil = int(self.config.get("auto_max_fan_level_gpu", AUTO_MAX_FAN_LEVEL_GPU))
+
+        changed_cpu = _update_domain(self._auto_stagnation_cpu, cpu_temp, cpu_ceil)
+        changed_gpu = _update_domain(self._auto_stagnation_gpu, gpu_temp, gpu_ceil)
+
+        return (
+            self._auto_stagnation_cpu["boost_level"],
+            self._auto_stagnation_gpu["boost_level"],
+            (changed_cpu or changed_gpu),
+        )
 
     def apply_auto_rpm_feedback(
         self,
@@ -1818,6 +2079,8 @@ class FanController(
         self._consecutive_rpm_shortfall_gpu = 0
         self._rpm_feedback_trim_cpu = 0
         self._rpm_feedback_trim_gpu = 0
+        self.reset_auto_emergency_state()
+        self.reset_auto_stagnation_state()
 
     def calibrate(self) -> Generator[int, None, tuple[int, int]]:
         if not self.fan_control_available:

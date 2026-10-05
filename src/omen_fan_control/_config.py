@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 from ._constants import (
+    AUTO_EMERGENCY_CONFIRMATION_SEC,
+    AUTO_EMERGENCY_RECOVERY_TEMP,
+    AUTO_EMERGENCY_TEMP_THRESHOLD,
+    AUTO_MAX_FAN_LEVEL_CPU,
+    AUTO_MAX_FAN_LEVEL_GPU,
+    AUTO_STAGNATION_ACTIVATION_TEMP,
+    AUTO_STAGNATION_INITIAL_BOOST_LEVEL,
+    AUTO_STAGNATION_MIN_IMPROVEMENT_TEMP,
+    AUTO_STAGNATION_RECOVERY_TEMP,
+    AUTO_STAGNATION_STEP_BOOST_LEVEL,
+    AUTO_STAGNATION_STEP_INTERVAL_SEC,
+    AUTO_STAGNATION_WINDOW_SEC,
     CONFIG_FILE,
     CONFIG_VERSION,
     DEFAULT_CALIBRATION_WAIT,
@@ -74,6 +86,18 @@ class ConfigDict(TypedDict, total=False):
     gpu_curve_use_gpu_temp: bool
     last_patched_cpu_max_rpm: int | None
     last_patched_gpu_max_rpm: int | None
+    auto_stagnation_activation_temp: float
+    auto_stagnation_window_sec: float
+    auto_stagnation_min_improvement_temp: float
+    auto_stagnation_recovery_temp: float
+    auto_stagnation_initial_boost: int
+    auto_stagnation_step_boost: int
+    auto_stagnation_step_interval_sec: float
+    auto_max_fan_level_cpu: int
+    auto_max_fan_level_gpu: int
+    auto_emergency_temp_threshold: float
+    auto_emergency_confirmation_sec: float
+    auto_emergency_recovery_temp: float
 
 
 DEFAULT_CONFIG: ConfigDict = {
@@ -109,6 +133,18 @@ DEFAULT_CONFIG: ConfigDict = {
     "gpu_curve_use_gpu_temp": True,
     "last_patched_cpu_max_rpm": None,
     "last_patched_gpu_max_rpm": None,
+    "auto_stagnation_activation_temp": AUTO_STAGNATION_ACTIVATION_TEMP,
+    "auto_stagnation_window_sec": AUTO_STAGNATION_WINDOW_SEC,
+    "auto_stagnation_min_improvement_temp": AUTO_STAGNATION_MIN_IMPROVEMENT_TEMP,
+    "auto_stagnation_recovery_temp": AUTO_STAGNATION_RECOVERY_TEMP,
+    "auto_stagnation_initial_boost": AUTO_STAGNATION_INITIAL_BOOST_LEVEL,
+    "auto_stagnation_step_boost": AUTO_STAGNATION_STEP_BOOST_LEVEL,
+    "auto_stagnation_step_interval_sec": AUTO_STAGNATION_STEP_INTERVAL_SEC,
+    "auto_max_fan_level_cpu": AUTO_MAX_FAN_LEVEL_CPU,
+    "auto_max_fan_level_gpu": AUTO_MAX_FAN_LEVEL_GPU,
+    "auto_emergency_temp_threshold": AUTO_EMERGENCY_TEMP_THRESHOLD,
+    "auto_emergency_confirmation_sec": AUTO_EMERGENCY_CONFIRMATION_SEC,
+    "auto_emergency_recovery_temp": AUTO_EMERGENCY_RECOVERY_TEMP,
 }
 
 

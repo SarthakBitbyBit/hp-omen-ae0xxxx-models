@@ -289,38 +289,69 @@ def serve() -> None:
                     and controller.get_board_name() == "8CC0"
                     and getattr(controller, "is_experimental_control_enabled", lambda: False)()
                 ):
-                    state, state_changed = controller.update_auto_thermal_state(avg_temp, gpu_temp)
-                    if state == "idle":
-                        if state_changed:
+                    check_cpu_temp = max(float(current_temp) if current_temp else 0.0, float(avg_temp))
+                    em_state, em_changed = controller.update_auto_emergency_state(check_cpu_temp, gpu_temp)
+                    if em_state == "active":
+                        if em_changed:
                             click.echo(
-                                f"Auto thermal cooldown reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
-                                "— releasing fans to firmware AUTO."
+                                f"Emergency high-temperature detected (CPU: {check_cpu_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                "— commanding MAX fan cooling."
                             )
-                            controller.restore_firmware_auto()
-                        # Suppress repeated fan writes while staying in idle
+                            controller.set_experimental_fan_max(True)
+                            controller._emergency_max_commanded = True
                     else:
-                        if state_changed:
+                        if getattr(controller, "_emergency_max_commanded", False):
                             click.echo(
-                                f"Auto thermal trigger reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
-                                "— engaging software AUTO fan control."
+                                f"Emergency cooling recovered (CPU: {check_cpu_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                "— returning to normal software AUTO control."
                             )
-                        auto_report = controller.calculate_auto_target(avg_temp, gpu_temp)
-                        target_cpu_level = auto_report["cpu_fan_level"]
-                        target_gpu_level = auto_report["gpu_fan_level"]
+                            controller.set_experimental_fan_max(False)
+                            controller._emergency_max_commanded = False
 
-                        if getattr(controller, "is_experimental_telemetry_enabled", lambda: False)():
-                            telemetry = controller.read_experimental_fan_telemetry()
-                            if telemetry is not None:
-                                act_cpu, act_gpu = telemetry
-                                trim_cpu, trim_gpu = controller.apply_auto_rpm_feedback(
-                                    act_cpu, act_gpu, auto_report["target_cpu_rpm"], auto_report["target_gpu_rpm"]
+                        state, state_changed = controller.update_auto_thermal_state(avg_temp, gpu_temp)
+                        if state == "idle":
+                            if state_changed:
+                                click.echo(
+                                    f"Auto thermal cooldown reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                    "— releasing fans to firmware AUTO."
                                 )
-                                if trim_cpu > 0:
-                                    target_cpu_level = min(100, target_cpu_level + trim_cpu)
-                                if trim_gpu > 0:
-                                    target_gpu_level = min(100, target_gpu_level + trim_gpu)
+                                controller.restore_firmware_auto()
+                            # Suppress repeated fan writes while staying in idle
+                        else:
+                            if state_changed:
+                                click.echo(
+                                    f"Auto thermal trigger reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                    "— engaging software AUTO fan control."
+                                )
+                            boost_c, boost_g, boost_changed = controller.update_auto_stagnation_state(avg_temp, gpu_temp)
+                            if boost_changed and (boost_c > 0 or boost_g > 0):
+                                click.echo(
+                                    f"Auto thermal stagnation boost engaged (CPU +{boost_c}, GPU +{boost_g}) "
+                                    f"at CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C."
+                                )
+                            elif boost_changed and boost_c == 0 and boost_g == 0:
+                                click.echo(
+                                    f"Auto thermal recovery reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                    "— releasing stagnation boost."
+                                )
 
-                        controller.set_experimental_fan_speed(target_cpu_level, target_gpu_level)
+                            auto_report = controller.calculate_auto_target(avg_temp, gpu_temp)
+                            target_cpu_level = auto_report["cpu_fan_level"]
+                            target_gpu_level = auto_report["gpu_fan_level"]
+
+                            if getattr(controller, "is_experimental_telemetry_enabled", lambda: False)():
+                                telemetry = controller.read_experimental_fan_telemetry()
+                                if telemetry is not None:
+                                    act_cpu, act_gpu = telemetry
+                                    trim_cpu, trim_gpu = controller.apply_auto_rpm_feedback(
+                                        act_cpu, act_gpu, auto_report["target_cpu_rpm"], auto_report["target_gpu_rpm"]
+                                    )
+                                    if trim_cpu > 0:
+                                        target_cpu_level = min(100, target_cpu_level + trim_cpu)
+                                    if trim_gpu > 0:
+                                        target_gpu_level = min(100, target_gpu_level + trim_gpu)
+
+                            controller.set_experimental_fan_speed(target_cpu_level, target_gpu_level)
                 else:
                     configured_curve = controller.config.get("curve", [])
                     if configured_curve:
