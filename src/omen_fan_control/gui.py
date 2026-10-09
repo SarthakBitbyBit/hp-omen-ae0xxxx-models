@@ -905,10 +905,13 @@ class MainWindow(QMainWindow):
         exp_layout.addWidget(self.exp_check)
         
         self.exp_options_widget = QWidget()
-        exp_opt_layout = QHBoxLayout(self.exp_options_widget)
+        exp_opt_layout = QVBoxLayout(self.exp_options_widget)
         exp_opt_layout.setContentsMargins(20, 0, 0, 0)
+        exp_opt_layout.setSpacing(4)
         
-        exp_opt_layout.addWidget(QLabel("Force Thermal Profile:"))
+        row_profile = QHBoxLayout()
+        row_profile.setContentsMargins(0, 0, 0, 0)
+        row_profile.addWidget(QLabel("Force Thermal Profile:"))
         
         self.profile_combo = QComboBox()
         self.profile_combo.addItems(["Omen", "Omen V1", "Omen V1 Legacy", "Omen V1 No EC", "Victus", "Victus S"])
@@ -925,16 +928,28 @@ class MainWindow(QMainWindow):
             "victus_s": 5
         }.get(current_profile, 0)
         self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.currentIndexChanged.connect(self.update_profile_warning)
         
-        exp_opt_layout.addWidget(self.profile_combo)
+        row_profile.addWidget(self.profile_combo)
         
         self.exp_save_btn = QPushButton("Save")
         self.exp_save_btn.setFixedWidth(60)
-        self.exp_save_btn.setStyleSheet("background-color: #2e7d32; padding: 5px;")
+        self.exp_save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.exp_save_btn.setStyleSheet("""
+            QPushButton { background-color: #388e3c; color: white; padding: 5px; border-radius: 3px; font-weight: bold; }
+            QPushButton:hover { background-color: #2e7d32; }
+            QPushButton:pressed { background-color: #1b5e20; }
+        """)
         self.exp_save_btn.clicked.connect(self.save_options)
-        exp_opt_layout.addWidget(self.exp_save_btn)
+        row_profile.addWidget(self.exp_save_btn)
         
-        exp_opt_layout.addStretch()
+        row_profile.addStretch()
+        exp_opt_layout.addLayout(row_profile)
+        
+        self.profile_reinstall_warning_lbl = QLabel("⚠️ Reinstall/repatch the driver for the thermal profile change to take effect.")
+        self.profile_reinstall_warning_lbl.setStyleSheet("color: #ff9800; font-size: 11px; font-weight: bold;")
+        self.profile_reinstall_warning_lbl.setVisible(False)
+        exp_opt_layout.addWidget(self.profile_reinstall_warning_lbl)
         
         exp_layout.addWidget(self.exp_options_widget)
         
@@ -942,6 +957,7 @@ class MainWindow(QMainWindow):
         
         # Init visibility
         self.exp_options_widget.setVisible(self.exp_check.isChecked())
+        self.update_profile_warning()
 
         # 4. Advanced Fan Control Group
         adv_box = QVBoxLayout()
@@ -1710,6 +1726,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(msg)
             self.status_label.setStyleSheet("color: #888; padding: 5px;")
             self.update_manual_max_source_label()
+            self.update_profile_warning()
             QMessageBox.information(self, "Driver Install", msg)
         else:
             if msg == "PWM_DETECTED":
@@ -1775,16 +1792,23 @@ class MainWindow(QMainWindow):
 
         self.temp_history_len = self.ma_spin.value()
         self.controller.save_config()
+        self.update_profile_warning()
         
         # If save button was clicked on exp options, give feedback
         sender = self.sender()
         if sender == getattr(self, 'exp_save_btn', None):
-             self.status_label.setText("Settings saved.")
-             QTimer.singleShot(2000, self.check_driver_status)
+             if hasattr(self, "profile_reinstall_warning_lbl") and self.profile_reinstall_warning_lbl.isVisible():
+                 self.status_label.setText("Profile saved. Reinstall/repatch driver to apply.")
+                 self.status_label.setStyleSheet("color: #ff9800; padding: 5px;")
+             else:
+                 self.status_label.setText("Settings saved.")
+                 self.status_label.setStyleSheet("color: #888; padding: 5px;")
+             QTimer.singleShot(4000, self.check_driver_status)
 
     def toggle_experimental_options(self, checked):
         self.exp_options_widget.setVisible(checked)
         self.save_options()
+        self.update_profile_warning()
 
     def toggle_advanced_fan_control(self, checked):
         self.controller.config["use_advanced_fan_control"] = checked
@@ -1949,6 +1973,43 @@ class MainWindow(QMainWindow):
                 self.over_ceiling_warning_lbl.setVisible(True)
             else:
                 self.over_ceiling_warning_lbl.setVisible(False)
+
+    def update_profile_warning(self):
+        if not hasattr(self, "profile_reinstall_warning_lbl") or not hasattr(self, "profile_combo"):
+            return
+
+        profile_map = {
+            0: "omen", 
+            1: "omen_v1", 
+            2: "omen_v1_legacy", 
+            3: "omen_v1_no_ec", 
+            4: "victus", 
+            5: "victus_s"
+        }
+        selected = profile_map.get(self.profile_combo.currentIndex(), "omen")
+        last_patched = self.controller.get_last_patched_thermal_profile()
+        itype = self.controller.check_install_type()
+
+        if itype is not None:
+            if last_patched is not None:
+                if selected != last_patched:
+                    self.profile_reinstall_warning_lbl.setText("⚠️ Reinstall/repatch the driver for the thermal profile change to take effect.")
+                    self.profile_reinstall_warning_lbl.setVisible(True)
+                else:
+                    self.profile_reinstall_warning_lbl.setVisible(False)
+            else:
+                saved = self.controller.config.get("thermal_profile", "omen")
+                if selected != saved or (hasattr(self, "exp_check") and self.exp_check.isChecked() and selected != "omen"):
+                    self.profile_reinstall_warning_lbl.setText("⚠️ Reinstall/repatch the driver for the thermal profile change to take effect.")
+                    self.profile_reinstall_warning_lbl.setVisible(True)
+                else:
+                    self.profile_reinstall_warning_lbl.setVisible(False)
+        else:
+            if selected != "omen" and hasattr(self, "exp_check") and self.exp_check.isChecked():
+                self.profile_reinstall_warning_lbl.setText("⚠️ This profile will be applied after installing the driver patch.")
+                self.profile_reinstall_warning_lbl.setVisible(True)
+            else:
+                self.profile_reinstall_warning_lbl.setVisible(False)
 
     def on_method_changed(self, index):
         method_map = {0: "percentage", 1: "asymmetrical", 2: "custom_gpu"}

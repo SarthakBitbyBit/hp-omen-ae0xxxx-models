@@ -205,6 +205,7 @@ class DriverInstallerMixin:
         eff_cpu, eff_gpu = controller.get_effective_fan_limits()
         controller.config["last_patched_cpu_max_rpm"] = eff_cpu
         controller.config["last_patched_gpu_max_rpm"] = eff_gpu
+        controller.config["last_patched_thermal_profile"] = controller.config.get("thermal_profile", "omen")
         controller.config["install_type"] = "temporary"
         controller.save_config()
 
@@ -243,6 +244,7 @@ class DriverInstallerMixin:
         eff_cpu, eff_gpu = controller.get_effective_fan_limits()
         controller.config["last_patched_cpu_max_rpm"] = eff_cpu
         controller.config["last_patched_gpu_max_rpm"] = eff_gpu
+        controller.config["last_patched_thermal_profile"] = controller.config.get("thermal_profile", "omen")
         controller.config["install_type"] = "permanent"
         controller.save_config()
 
@@ -332,6 +334,9 @@ class DriverInstallerMixin:
             return (cal_cpu or cal_gpu, cal_gpu or cal_cpu)
 
         return None, None
+
+    def get_last_patched_thermal_profile(self) -> str | None:
+        return self.config.get("last_patched_thermal_profile")
 
     def restore_driver(self) -> tuple[bool, str]:
         messages: list[str] = []

@@ -71,6 +71,7 @@ class ConfigDict(TypedDict, total=False):
     gpu_curve_use_gpu_temp: bool
     last_patched_cpu_max_rpm: int | None
     last_patched_gpu_max_rpm: int | None
+    last_patched_thermal_profile: str | None
 
 
 DEFAULT_CONFIG: ConfigDict = {
@@ -103,6 +104,7 @@ DEFAULT_CONFIG: ConfigDict = {
     "gpu_curve_use_gpu_temp": True,
     "last_patched_cpu_max_rpm": None,
     "last_patched_gpu_max_rpm": None,
+    "last_patched_thermal_profile": None,
 }
 
 

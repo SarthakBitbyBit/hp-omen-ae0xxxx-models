@@ -123,6 +123,8 @@ def options(wait_time, watchdog, ma_window, bypass_patch_warning, curve_interpol
              controller.config['thermal_profile'] = thermal_profile
              changed = True
              click.echo(f"Thermal Profile set to {thermal_profile}")
+             if controller.check_install_type() is not None:
+                 click.echo(click.style("Notice: Reinstall/repatch the driver ('omen-fan-control install-patch permanent') for the profile change to take effect.", fg="yellow"))
 
     if curve_interpolation is not None:
         if curve_interpolation == 'show':
