@@ -1705,25 +1705,33 @@ class MainWindow(QMainWindow):
 
     def on_driver_finished(self, result, type_):
         success, msg = result
-        self.status_label.setText(msg)
         
         if success:
+            self.status_label.setText(msg)
             self.status_label.setStyleSheet("color: #888; padding: 5px;")
             self.update_manual_max_source_label()
             QMessageBox.information(self, "Driver Install", msg)
         else:
-            self.status_label.setStyleSheet("color: #d63333; padding: 5px;")
             if msg == "PWM_DETECTED":
-                # Ask user to force
-                reply = QMessageBox.question(self, "Driver Detected", 
-                                             "The driver appears to be already active (pwm1 exists).\n\nDo you want to force install anyway?",
-                                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                self.status_label.setText("Driver already active.")
+                self.status_label.setStyleSheet("color: #ff9800; padding: 5px;")
+                itype = self.controller.check_install_type()
+                msg_add = f"\n(Current installation seems to be {itype}.)" if itype else ""
+                reply = QMessageBox.question(
+                    self,
+                    "Driver Detected", 
+                    f"The driver appears to be already active (pwm1 exists).{msg_add}\n\nDo you want to force reinstall anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
                 if reply == QMessageBox.StandardButton.Yes:
-                    # Retry with force=True
                     self.run_driver_task(type_, force=True)
                 else:
                     self.status_label.setText("Install cancelled.")
+                    self.status_label.setStyleSheet("color: #888; padding: 5px;")
             elif msg.startswith("LOW_MAX_RPM_DETECTED:"):
+                self.status_label.setText("Low max RPM detected.")
+                self.status_label.setStyleSheet("color: #ff9800; padding: 5px;")
                 detected_rpm = msg.split(":")[1]
                 reply = QMessageBox.question(
                     self,
@@ -1738,7 +1746,10 @@ class MainWindow(QMainWindow):
                     self.run_driver_task(type_, force=True)
                 else:
                     self.status_label.setText("Install cancelled. Run Calibration first.")
+                    self.status_label.setStyleSheet("color: #888; padding: 5px;")
             else:
+                self.status_label.setText(msg)
+                self.status_label.setStyleSheet("color: #d63333; padding: 5px;")
                 QMessageBox.critical(self, "Driver Install Error", msg)
 
     def save_options(self):
