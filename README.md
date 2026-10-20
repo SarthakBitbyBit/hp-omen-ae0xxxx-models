@@ -10,7 +10,7 @@ This tool includes a backported `hp-wmi` driver patch from the latest Linux kern
 2. **HP Victus**
 3. **HP Omen**
 
-This patch applies across all 6.x releases and kernels 7.0–7.2.
+This patch applies across Linux 5.15+ (including Ubuntu 22.04 LTS), all 6.x releases, and kernels 7.0–7.2.
 
 **Reference Kernel Commit:**
 [platform/x86: hp-wmi: add manual fan control for Victus S models](https://git.kernel.org/pub/scm/linux/kernel/git/pdx86/platform-drivers-x86.git/commit/?h=for-next&id=46be1453e6e61884b4840a768d1e8ffaf01a4c1c)
@@ -40,14 +40,11 @@ You must install kernel headers and build tools for the driver patch to compile 
 
 * **Debian / Ubuntu / Pop!_OS / Linux Mint:**
   ```bash
-  sudo apt install linux-headers-$(uname -r) \
-                   linux-headers-$(uname -r | sed 's/-[^-]*$/-common/') \
-                   "linux-kbuild-$(uname -r | cut -d. -f1,2,3 | cut -d+ -f1)*" \
-                   build-essential dkms
-  # Optional (for fan cleaner feature):
-  sudo apt install acpi_call-dkms
+  sudo apt install linux-headers-$(uname -r) build-essential dkms
+  # Optional (for fan cleaner feature, on supported OMEN MAX boards):
+  sudo apt install acpi-call-dkms
   ```
-  > **Note:** Debian and Ubuntu split kernel headers into multiple packages: architecture-specific (`linux-headers-<version>-amd64`), common (`linux-headers-<version>-common`), and build scripts (`linux-kbuild-<version>`). All must be installed for out-of-tree module compilation.
+  > **Note:** `linux-headers-$(uname -r)` automatically pulls in all required common headers and build tools for your current kernel. If you prefer to track kernel updates via a metapackage, use `linux-headers-generic` (Ubuntu/Mint/Pop!_OS) or `linux-headers-amd64` (Debian). These dependency commands are continuously verified across containerized distributions via `tests/test_distro_containers.py`.
 
 * **Fedora / RHEL / Rocky Linux:**
   ```bash

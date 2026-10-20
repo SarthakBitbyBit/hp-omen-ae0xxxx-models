@@ -1,5 +1,5 @@
 obj-m += hp-wmi.o
-ccflags-y += -Wno-declaration-after-statement
+ccflags-y += -Wno-declaration-after-statement -std=gnu11
 
 KVERSION ?= $(shell uname -r)
 KERNEL_BUILD ?= /lib/modules/$(KVERSION)/build
@@ -31,7 +31,8 @@ check-env:
 		echo ""; \
 		exit 1; \
 	fi
-	@if [ ! -f "$(KERNEL_BUILD)/scripts/basic/Makefile" ] && [ ! -f "$$(readlink -f $(KERNEL_BUILD))/scripts/basic/Makefile" ]; then \
+	@if [ ! -f "$(KERNEL_BUILD)/scripts/basic/Makefile" ] && [ ! -f "$$(readlink -f $(KERNEL_BUILD))/scripts/basic/Makefile" ] && \
+	    [ ! -f "$(KERNEL_BUILD)/scripts/basic/fixdep" ] && [ ! -f "$$(readlink -f $(KERNEL_BUILD))/scripts/basic/fixdep" ]; then \
 		echo ""; \
 		echo "ERROR: scripts/basic/Makefile not found."; \
 		echo ""; \

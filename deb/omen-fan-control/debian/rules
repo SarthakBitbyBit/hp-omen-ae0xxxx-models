@@ -7,7 +7,7 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 	dh $@
 
 override_dh_auto_build:
-	python3 -m build --wheel -o dist/
+	python3 -m build --wheel --no-isolation -o dist/
 
 override_dh_auto_install:
 	install -d debian/omen-fan-control/usr

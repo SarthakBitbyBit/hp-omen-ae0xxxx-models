@@ -213,12 +213,14 @@ static struct device *devm_platform_profile_register(struct device *dev, const c
 #define system_dfl_wq system_wq
 #endif
 
+#ifndef devm_mutex_init
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 static inline int devm_mutex_init(struct device *dev, struct mutex *lock)
 {
 	mutex_init(lock);
 	return 0;
 }
+#endif
 #endif
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
