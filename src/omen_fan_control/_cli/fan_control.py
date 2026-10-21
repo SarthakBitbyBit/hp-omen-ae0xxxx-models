@@ -59,12 +59,12 @@ def fan_control(
             if not service_active:
                 click.echo(click.style("WARNING: Service is NOT running. Curve mode requires the service.", fg="yellow"))
                 click.echo("Changes will be written to volatile config but won't take effect until service starts.")
-        else:
+        elif mode == "manual":
             if service_active:
                 click.echo("Stopping service for temporary manual control...")
                 controller.stop_service()
 
-    if not controller.fan_control_available:
+    if not controller.is_fan_control_ready():
         click.echo("Error: Fan control interface is not available.")
         sys.exit(1)
 

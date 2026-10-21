@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=OMEN Fan Control
+Comment=Fan control and hardware monitoring for HP OMEN laptops
+Exec=omen-fan-control-gui
+Icon=omen-fan-control
+Terminal=false
+Type=Application
+Categories=System;HardwareSettings;Settings;
+StartupNotify=true
+Keywords=omen;fan;cooling;hp;hardware;temperature;rpm;

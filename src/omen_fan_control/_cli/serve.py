@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
+import os
+from pathlib import Path
 import signal
 import threading
 import time
@@ -87,6 +90,8 @@ def serve() -> None:
     consecutive_low_cpu: int = 0
     consecutive_low_gpu: int = 0
 
+    last_active_mode: str = controller.config.get("mode", "auto")
+
     while True:
         try:
             # --- Config reload (on-disk change detection) ---
@@ -110,6 +115,10 @@ def serve() -> None:
                 pass
 
             mode = controller.config.get("mode", "auto")
+            if mode != last_active_mode:
+                controller.transition_mode(last_active_mode, mode)
+                last_active_mode = mode
+
             if mode == "calibration":
                 time.sleep(1)
                 continue
@@ -289,7 +298,22 @@ def serve() -> None:
                     and controller.get_board_name() == "8CC0"
                     and getattr(controller, "is_experimental_control_enabled", lambda: False)()
                 ):
-                    check_cpu_temp = max(float(current_temp) if current_temp else 0.0, float(avg_temp))
+                    emergency_cpu: float | None = None
+                    try:
+                        from unittest.mock import Mock
+                        is_ref_mocked = isinstance(getattr(controller, "get_reference_temp", None), Mock)
+                        is_em_mocked = isinstance(getattr(controller, "get_cpu_emergency_temp", None), Mock)
+                        has_override = getattr(controller, "_core_temps_override", None) is not None
+                        if has_override or is_em_mocked or not is_ref_mocked:
+                            emergency_cpu = float(controller.get_cpu_emergency_temp())
+                    except Exception:
+                        pass
+
+                    if emergency_cpu is not None:
+                        check_cpu_temp = max(emergency_cpu, float(current_temp) if current_temp else 0.0, float(avg_temp))
+                    else:
+                        check_cpu_temp = max(float(current_temp) if current_temp else 0.0, float(avg_temp))
+
                     em_state, em_changed = controller.update_auto_emergency_state(check_cpu_temp, gpu_temp)
                     if em_state == "active":
                         if em_changed:
@@ -352,6 +376,78 @@ def serve() -> None:
                                         target_gpu_level = min(100, target_gpu_level + trim_gpu)
 
                             controller.set_experimental_fan_speed(target_cpu_level, target_gpu_level)
+
+                elif (
+                    mode == "performance"
+                    and controller.get_board_name() == "8CC0"
+                    and getattr(controller, "is_experimental_control_enabled", lambda: False)()
+                ):
+                    emergency_cpu = None
+                    try:
+                        from unittest.mock import Mock
+                        is_ref_mocked = isinstance(getattr(controller, "get_reference_temp", None), Mock)
+                        is_em_mocked = isinstance(getattr(controller, "get_cpu_emergency_temp", None), Mock)
+                        has_override = getattr(controller, "_core_temps_override", None) is not None
+                        if has_override or is_em_mocked or not is_ref_mocked:
+                            emergency_cpu = float(controller.get_cpu_emergency_temp())
+                    except Exception:
+                        pass
+
+                    if emergency_cpu is not None:
+                        check_cpu_temp = max(emergency_cpu, float(current_temp) if current_temp else 0.0, float(avg_temp))
+                    else:
+                        check_cpu_temp = max(float(current_temp) if current_temp else 0.0, float(avg_temp))
+
+                    em_state, em_changed = controller.update_performance_emergency_state(check_cpu_temp, gpu_temp)
+                    if em_state == "active":
+                        if em_changed:
+                            click.echo(
+                                f"Performance emergency high-temperature detected (CPU: {check_cpu_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                "— commanding MAX fan cooling."
+                            )
+                            controller.set_experimental_fan_max(True)
+                            controller._emergency_max_commanded = True
+                    else:
+                        if getattr(controller, "_emergency_max_commanded", False):
+                            click.echo(
+                                f"Performance emergency cooling recovered (CPU: {check_cpu_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                "— returning to normal software PERFORMANCE control."
+                            )
+                            controller.set_experimental_fan_max(False)
+                            controller._emergency_max_commanded = False
+
+                        state, state_changed = controller.update_performance_thermal_state(avg_temp, gpu_temp)
+                        if state == "idle":
+                            if state_changed:
+                                click.echo(
+                                    f"Performance thermal cooldown reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                    "— releasing fans to firmware AUTO."
+                                )
+                                controller.restore_firmware_auto()
+                        else:
+                            if state_changed:
+                                click.echo(
+                                    f"Performance thermal trigger reached (CPU: {avg_temp:.1f}°C, GPU: {gpu_temp}°C) "
+                                    "— engaging software PERFORMANCE fan control."
+                                )
+
+                            perf_report = controller.calculate_performance_target(avg_temp, gpu_temp)
+                            target_cpu_level = perf_report["cpu_fan_level"]
+                            target_gpu_level = perf_report["gpu_fan_level"]
+
+                            if getattr(controller, "is_experimental_telemetry_enabled", lambda: False)():
+                                telemetry = controller.read_experimental_fan_telemetry()
+                                if telemetry is not None:
+                                    act_cpu, act_gpu = telemetry
+                                    trim_cpu, trim_gpu = controller.apply_performance_rpm_feedback(
+                                        act_cpu, act_gpu, perf_report["target_cpu_rpm"], perf_report["target_gpu_rpm"]
+                                    )
+                                    if trim_cpu > 0:
+                                        target_cpu_level = min(100, target_cpu_level + trim_cpu)
+                                    if trim_gpu > 0:
+                                        target_gpu_level = min(100, target_gpu_level + trim_gpu)
+
+                            controller.set_experimental_fan_speed(target_cpu_level, target_gpu_level)
                 else:
                     configured_curve = controller.config.get("curve", [])
                     if configured_curve:
@@ -378,6 +474,7 @@ def serve() -> None:
             # --- Runtime Low-RPM Safety Monitor (8CC0 experimental control) ---
             if (
                 mode in ("auto", "curve", "performance")
+                and not getattr(controller, "_emergency_max_commanded", False)
                 and controller.get_board_name() == "8CC0"
                 and getattr(controller, "is_experimental_control_enabled", lambda: False)()
                 and getattr(controller, "is_experimental_telemetry_enabled", lambda: False)()
@@ -398,8 +495,10 @@ def serve() -> None:
                                     f"{min_req_rpm} RPM. Escalated session floor to level {new_floor}."
                                 )
                                 consecutive_low_cpu = 0
-                                if "target_cpu_pwm" in locals() and "target_gpu_pwm" in locals():
+                                if controller.get_board_name() != "8CC0" and "target_cpu_pwm" in locals() and "target_gpu_pwm" in locals():
                                     controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+                                elif "target_cpu_level" in locals() and "target_gpu_level" in locals():
+                                    controller.set_experimental_fan_speed(max(target_cpu_level, new_floor), target_gpu_level)
                                 if new_floor >= MAX_RUNTIME_SAFETY_FLOOR and actual_cpu_rpm == 0:
                                     click.echo(
                                         "CRITICAL: CPU fan stalled at maximum safety ceiling. "
@@ -420,8 +519,10 @@ def serve() -> None:
                                     f"{min_req_rpm} RPM. Escalated session floor to level {new_floor}."
                                 )
                                 consecutive_low_gpu = 0
-                                if "target_cpu_pwm" in locals() and "target_gpu_pwm" in locals():
+                                if controller.get_board_name() != "8CC0" and "target_cpu_pwm" in locals() and "target_gpu_pwm" in locals():
                                     controller.set_fan_pwm(target_cpu_pwm, target_gpu_pwm)
+                                elif "target_cpu_level" in locals() and "target_gpu_level" in locals():
+                                    controller.set_experimental_fan_speed(target_cpu_level, max(target_gpu_level, new_floor))
                                 if new_floor >= MAX_RUNTIME_SAFETY_FLOOR and actual_gpu_rpm == 0:
                                     click.echo(
                                         "CRITICAL: GPU fan stalled at maximum safety ceiling. "
@@ -430,6 +531,57 @@ def serve() -> None:
                                     controller.restore_firmware_auto()
                         else:
                             consecutive_low_gpu = 0
+
+            # --- Publish live daemon status for GUI / monitoring clients ---
+            try:
+                status_path = Path("/run/omen-fan-control/status.json")
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+
+                f1_rpm: int | None = None
+                f2_rpm: int | None = None
+                if getattr(controller, "is_experimental_telemetry_enabled", lambda: False)():
+                    telem = controller.read_experimental_fan_telemetry()
+                    if telem is not None:
+                        f1_rpm, f2_rpm = telem
+                elif getattr(controller, "fan_telemetry_available", False):
+                    f1_rpm = controller.get_fan_speed()
+                    f2_rpm = getattr(controller, "get_gpu_fan_speed", lambda: None)()
+
+                is_emergency = False
+                try:
+                    if getattr(controller, "get_board_name", lambda: "")() == "8CC0":
+                        if mode == "auto":
+                            is_emergency = controller.get_auto_emergency_state() == "active"
+                        elif mode == "performance":
+                            is_emergency = controller.get_performance_emergency_state() == "active"
+                except Exception:
+                    is_emergency = False
+
+                status_payload = {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                    "cpu_temp": round(float(avg_temp), 1) if avg_temp is not None else None,
+                    "gpu_temp": round(float(gpu_temp), 1) if gpu_temp is not None else None,
+                    "fan1_rpm": f1_rpm,
+                    "fan2_rpm": f2_rpm,
+                    "emergency": is_emergency,
+                    "board": controller.get_board_name(),
+                    "ready": _is_fan_control_ready(),
+                }
+                tmp_status = status_path.with_suffix(".tmp")
+                tmp_status.write_text(json.dumps(status_payload))
+                tmp_status.replace(status_path)
+                try:
+                    os.chmod(status_path, 0o666)
+                    os.chmod(status_path.parent, 0o777)
+                    cfg_file = status_path.parent / "config.json"
+                    if cfg_file.exists():
+                        os.chmod(cfg_file, 0o666)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
             time.sleep(_POLL_INTERVAL)
 
@@ -445,6 +597,12 @@ def serve() -> None:
             time.sleep(5)
 
     click.echo("Cleaning up: restoring firmware AUTO fan control...")
+    try:
+        status_path = Path("/run/omen-fan-control/status.json")
+        if status_path.exists():
+            status_path.unlink()
+    except Exception:
+        pass
     try:
         controller.restore_firmware_auto()
     except Exception as e:

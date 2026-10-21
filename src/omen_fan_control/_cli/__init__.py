@@ -102,6 +102,14 @@ def main() -> None:
 # Register extracted subcommands into the cli group
 
 from .calibrate import calibrate, calibrate_min  # noqa: E402
+from .driver_cli import (  # noqa: E402
+    driver_init,
+    driver_restore,
+    driver_status,
+    install_system,
+    rollback,
+    uninstall_system,
+)
 from .fan_control import fan_control  # noqa: E402
 from .install_patch import install_patch  # noqa: E402
 from .serve import serve  # noqa: E402
@@ -109,10 +117,16 @@ from .stress import stress  # noqa: E402
 
 cli.add_command(calibrate)
 cli.add_command(calibrate_min)
+cli.add_command(driver_init)
+cli.add_command(driver_restore)
+cli.add_command(driver_status)
 cli.add_command(fan_control)
 cli.add_command(install_patch)
+cli.add_command(install_system)
+cli.add_command(rollback)
 cli.add_command(serve)
 cli.add_command(stress)
+cli.add_command(uninstall_system)
 
 try:
     from .. import cli as _full_cli  # noqa: F401, E402

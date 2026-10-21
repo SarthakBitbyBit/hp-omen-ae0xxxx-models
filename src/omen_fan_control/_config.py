@@ -22,6 +22,11 @@ from ._constants import (
     CONFIG_VERSION,
     DEFAULT_CALIBRATION_WAIT,
     DEFAULT_WATCHDOG_INTERVAL,
+    PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+    PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+    PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+    PERFORMANCE_MAX_FAN_LEVEL_CPU,
+    PERFORMANCE_MAX_FAN_LEVEL_GPU,
     VOLATILE_CONFIG_FILE,
 )
 
@@ -98,6 +103,11 @@ class ConfigDict(TypedDict, total=False):
     auto_emergency_temp_threshold: float
     auto_emergency_confirmation_sec: float
     auto_emergency_recovery_temp: float
+    performance_emergency_temp_threshold: float
+    performance_emergency_confirmation_sec: float
+    performance_emergency_recovery_temp: float
+    performance_max_fan_level_cpu: int
+    performance_max_fan_level_gpu: int
 
 
 DEFAULT_CONFIG: ConfigDict = {
@@ -145,6 +155,11 @@ DEFAULT_CONFIG: ConfigDict = {
     "auto_emergency_temp_threshold": AUTO_EMERGENCY_TEMP_THRESHOLD,
     "auto_emergency_confirmation_sec": AUTO_EMERGENCY_CONFIRMATION_SEC,
     "auto_emergency_recovery_temp": AUTO_EMERGENCY_RECOVERY_TEMP,
+    "performance_emergency_temp_threshold": PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+    "performance_emergency_confirmation_sec": PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+    "performance_emergency_recovery_temp": PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+    "performance_max_fan_level_cpu": PERFORMANCE_MAX_FAN_LEVEL_CPU,
+    "performance_max_fan_level_gpu": PERFORMANCE_MAX_FAN_LEVEL_GPU,
 }
 
 
@@ -257,6 +272,11 @@ def save_config(
             except Exception:
                 pass
         os.replace(tmp_path, target_path)
+        if not volatile and VOLATILE_CONFIG_FILE.exists():
+            try:
+                VOLATILE_CONFIG_FILE.unlink()
+            except Exception:
+                pass
     except Exception:
         try:
             with open(target_path, "w") as f:

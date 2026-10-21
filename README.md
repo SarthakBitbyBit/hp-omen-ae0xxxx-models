@@ -22,9 +22,13 @@ This program also includes a modification that sets the max speed according to c
 
 * **OS:** Arch Linux 6.18, 6.19, 7.0, 7.1, 7.2; Ubuntu 24.04 (HWE 7.0)
 
-### Partial support — HP OMEN Gaming Laptop 16-ae0xxx (8CC0)
+### Hardware Validation — HP OMEN Gaming Laptop 16-ae0xxx (8CC0)
 
-Temperature monitoring is confirmed working on this board. **Manual fan control is not yet hardware-validated**: the board-specific WMI fan-control protocol has not been verified on `8CC0` hardware, so the tool will detect the board and display temperatures but will report fan-control commands as unavailable if the firmware does not respond as expected. Do not rely on fan speed management on this board without first confirming successful hardware validation and reporting it via an issue.
+Hardware-validated on Board `8CC0` (HP OMEN 16-ae0xxx, BIOS `F.19`, Kernel `7.0.0-38-generic`, Ubuntu 26.04.1 LTS):
+* **Dual-Driver Architecture:** Stock distro `hp-wmi` module in `/lib/modules/` remains 100% untouched as a safe fallback. The experimental patched module is installed to `/usr/lib/omen-fan-control/hp-wmi.ko`.
+* **Systemd Orchestration:** `omen-fan-control-driver.service` initializes and verifies the experimental driver on boot before `omen-fan-control.service` launches the polling daemon.
+* **WMI Domain 0x20008 Fan Control:** Hardware-validated support for **AUTO**, **PERFORMANCE**, and **MAX** modes, temperature-driven piecewise curves, stagnation boost, emergency spike protection (>85°C), and 0x2D dual RPM telemetry.
+* **Emergency Rollback:** Single-command rollback (`sudo omen-fan-control rollback`) restores the stock Ubuntu driver and disables hardware writes.
 
 > Would you like to add your model here? Create an issue with the "Tested Hardware" label and include these after successfully installing the patch and using the tool:
 > * Your laptop's board id (you can find it in /sys/class/dmi/id/board_name)
@@ -166,43 +170,61 @@ sudo env PYTHONPATH=src python -m omen_fan_control.cli status
 After installation, use `omen-fan-control` (CLI) and `omen-fan-control-gui` (GUI).
 From a clone, replace with `uv run omen-fan-control` or `PYTHONPATH=src python -m omen_fan_control.cli`.
 
-### GUI
+### Minimalist Linux GUI
 
+Launch as your regular desktop user (no `sudo` required):
 ```bash
-sudo omen-fan-control-gui
+omen-fan-control-gui
 ```
+The minimalist GUI provides instant answers to three essential questions:
+1. **How hot is my laptop?** — Live CPU and GPU temperatures with color-coded safety indicators.
+2. **How fast are the fans?** — Live Fan 1 (CPU) and Fan 2 (GPU) RPM telemetry.
+3. **What mode am I in?** — Prominent **AUTO**, **PERFORMANCE**, and **MAX** buttons with active mode highlighting.
 
-**GUI Fan Curve:**
+**Features:**
+* **Instant Volatile Mode Switching:** Directly updates `/run/omen-fan-control/config.json`. The running background daemon transitions modes immediately without restarting its process or PID.
+* **Emergency Cooling Banner:** Bright visual alert when temperature exceeds 85°C safety barriers.
+* **MAX ACTIVE Indicator:** High-visibility banner when maximum fan speed override is engaged.
+* **Read-Only Fallback:** Graceful fallback if the experimental driver is inactive or unverified.
 
-| <img width="400" height="300" alt="Omen Fan Control GUI" src="https://github.com/user-attachments/assets/57f1a966-d7a6-4c5f-8090-a1e947349bd9" /> |
-|---|
+---
 
-### CLI
+### CLI & Driver Lifecycle Management
+
+**System Installation (Driver + Systemd Services + Desktop Launcher):**
+```bash
+sudo omen-fan-control install-system
+```
+Installs the verified custom module to `/usr/lib/omen-fan-control/hp-wmi.ko`, configures both `omen-fan-control-driver.service` and `omen-fan-control.service`, and adds the desktop launcher to `/usr/share/applications/`.
+
+**Driver Status & Diagnostics:**
+```bash
+omen-fan-control driver-status
+```
+Displays loaded module status, custom vs stock active state, and sysfs attribute node presence.
+
+**Emergency Rollback to Stock Distro Driver:**
+```bash
+sudo omen-fan-control rollback
+```
+Stops project services, unloads the custom module, immediately restores Ubuntu's stock `hp-wmi` driver, and cleans volatile state.
+
+**Uninstall System Components:**
+```bash
+sudo omen-fan-control uninstall-system
+```
 
 **Check Status:**
 ```bash
 sudo omen-fan-control status
 ```
 
-**Settings:**
+**Mode Switching (Live / Volatile):**
 ```bash
-omen-fan-control settings --help
-omen-fan-control settings
-sudo omen-fan-control options --ma-window 10 --curve-interpolation smooth
-```
-
-**Fan Control:**
-```bash
-# Manual speed
-sudo omen-fan-control fan-control --mode manual --value 80%
-
-# Curve mode (requires service)
-sudo omen-fan-control fan-control --mode curve
-
-# Auto (default)
-sudo omen-fan-control fan-control --mode auto
-
-# Custom curve CSV (temp, percent per line)
+# Switch mode live without saving to persistent disk config:
+omen-fan-control fan-control --mode auto --no-save
+omen-fan-control fan-control --mode performance --no-save
+omen-fan-control fan-control --mode max --no-save
 sudo omen-fan-control fan-control --curve-csv my_curve.csv
 ```
 

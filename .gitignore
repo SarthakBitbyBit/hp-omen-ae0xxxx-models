@@ -3,6 +3,9 @@ tests/*
 !tests/test_fan_unavailable.py
 !tests/test_modes.py
 !tests/test_auto_mode.py
+!tests/test_driver_service.py
+!tests/test_systemd_units.py
+!tests/test_gui_minimal.py
 __pycache__
 **/__pycache__
 *.pyc

@@ -28,6 +28,9 @@ else:
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 VOLATILE_CONFIG_FILE = VOLATILE_CONFIG_DIR / "config.json"
+SYSTEM_RUN_DIR = Path("/run/omen-fan-control")
+SYSTEM_VOLATILE_CONFIG_FILE = SYSTEM_RUN_DIR / "config.json"
+SYSTEM_STATUS_FILE = SYSTEM_RUN_DIR / "status.json"
 
 DEFAULT_CALIBRATION_WAIT = 30
 DEFAULT_WATCHDOG_INTERVAL = 90
@@ -50,6 +53,7 @@ DEFAULT_FALLBACK_MIN_FAN_LEVEL = 15
 DEFAULT_CALIBRATION_CANDIDATE_LEVELS: tuple[int, ...] = (10, 12, 14, 16, 18, 20, 22, 25, 28, 30, 35, 40)
 MAX_RUNTIME_SAFETY_FLOOR = 50
 EXPERIMENTAL_FAN_SPEED_PATH = Path("/sys/devices/platform/hp-wmi/experimental_fan_speed")
+EXPERIMENTAL_FAN_MAX_PATH = Path("/sys/devices/platform/hp-wmi/experimental_fan_max")
 EXPERIMENTAL_FAN_TELEMETRY_PATH = Path("/sys/devices/platform/hp-wmi/experimental_fan_telemetry")
 EXPERIMENTAL_CONTROL_MODULE_PARAM = Path("/sys/module/hp_wmi/parameters/experimental_control")
 EXPERIMENTAL_TELEMETRY_MODULE_PARAM = Path("/sys/module/hp_wmi/parameters/experimental_telemetry")
@@ -140,6 +144,90 @@ AUTO_MAX_FAN_LEVEL: int = 61
 AUTO_EMERGENCY_TEMP_THRESHOLD: float = 85.0
 AUTO_EMERGENCY_CONFIRMATION_SEC: float = 3.0
 AUTO_EMERGENCY_RECOVERY_TEMP: float = 80.0
+
+# 8CC0 Windows OMEN Performance Mode Breakpoints & Constants
+ACTIVE_PERFORMANCE_MIN_RPM: int = 2000
+ACTIVE_PERFORMANCE_MIN_FAN_LEVEL: int = 20
+PERFORMANCE_ACTIVATION_CPU_TEMP: float = 55.0
+PERFORMANCE_ACTIVATION_GPU_TEMP: float = 45.0
+PERFORMANCE_COOLDOWN_CPU_TEMP: float = 50.0
+PERFORMANCE_COOLDOWN_GPU_TEMP: float = 40.0
+PERFORMANCE_CURVE_SOURCE_DEFINED = "DEFINED"
+PERFORMANCE_CURVE_SOURCE_OBSERVED_CEILING = "OBSERVED-CEILING"
+
+PERFORMANCE_BREAKPOINTS_TABLE: tuple[dict[str, Any], ...] = (
+    {
+        "temp": 55.0,
+        "cpu_rpm": 2000,
+        "gpu_rpm": 2000,
+        "cpu_level": 20,
+        "gpu_level": 20,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+    },
+    {
+        "temp": 60.0,
+        "cpu_rpm": 2500,
+        "gpu_rpm": 2600,
+        "cpu_level": 25,
+        "gpu_level": 26,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+    },
+    {
+        "temp": 65.0,
+        "cpu_rpm": 3200,
+        "gpu_rpm": 3400,
+        "cpu_level": 32,
+        "gpu_level": 34,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+    },
+    {
+        "temp": 70.0,
+        "cpu_rpm": 4000,
+        "gpu_rpm": 4200,
+        "cpu_level": 40,
+        "gpu_level": 42,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+    },
+    {
+        "temp": 75.0,
+        "cpu_rpm": 4800,
+        "gpu_rpm": 5100,
+        "cpu_level": 48,
+        "gpu_level": 51,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+    },
+    {
+        "temp": 80.0,
+        "cpu_rpm": 5400,
+        "gpu_rpm": 5700,
+        "cpu_level": 54,
+        "gpu_level": 57,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_DEFINED,
+    },
+    {
+        "temp": 85.0,
+        "cpu_rpm": 5700,
+        "gpu_rpm": 6100,
+        "cpu_level": 57,
+        "gpu_level": 61,
+        "source_cpu": PERFORMANCE_CURVE_SOURCE_OBSERVED_CEILING,
+        "source_gpu": PERFORMANCE_CURVE_SOURCE_OBSERVED_CEILING,
+    },
+)
+
+# 8CC0 Performance High-Temperature Spike Safety Barrier Constants
+PERFORMANCE_EMERGENCY_TEMP_THRESHOLD: float = 85.0
+PERFORMANCE_EMERGENCY_CONFIRMATION_SEC: float = 3.0
+PERFORMANCE_EMERGENCY_RECOVERY_TEMP: float = 80.0
+PERFORMANCE_MAX_FAN_LEVEL_CPU: int = 57
+PERFORMANCE_MAX_FAN_LEVEL_GPU: int = 61
+PERFORMANCE_MAX_FAN_LEVEL: int = 61
 
 # Thermal profile constants for OMEN v1 (modern OMEN)
 HP_OMEN_V1_THERMAL_PROFILE_DEFAULT = 0x30

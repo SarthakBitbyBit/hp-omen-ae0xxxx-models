@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, Sequence
 
 from ._cleaner import FanCleanerMixin
 from ._config import ConfigDict, load_config as _load_config, save_config as _save_config
@@ -67,9 +67,121 @@ from ._constants import (
     AUTO_STAGNATION_STEP_BOOST_LEVEL,
     AUTO_STAGNATION_STEP_INTERVAL_SEC,
     AUTO_STAGNATION_WINDOW_SEC,
+    ACTIVE_PERFORMANCE_MIN_RPM,
+    ACTIVE_PERFORMANCE_MIN_FAN_LEVEL,
+    PERFORMANCE_ACTIVATION_CPU_TEMP,
+    PERFORMANCE_ACTIVATION_GPU_TEMP,
+    PERFORMANCE_COOLDOWN_CPU_TEMP,
+    PERFORMANCE_COOLDOWN_GPU_TEMP,
+    PERFORMANCE_CURVE_SOURCE_DEFINED,
+    PERFORMANCE_CURVE_SOURCE_OBSERVED_CEILING,
+    PERFORMANCE_BREAKPOINTS_TABLE,
+    PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+    PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+    PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+    PERFORMANCE_MAX_FAN_LEVEL,
+    PERFORMANCE_MAX_FAN_LEVEL_CPU,
+    PERFORMANCE_MAX_FAN_LEVEL_GPU,
 )
 from ._driver import DriverInstallerMixin
 from ._service import ServiceManagerMixin
+
+
+class EmergencySafetyStateMachine:
+    """State machine for high-temperature spike filtering and emergency MAX cooling.
+
+    Prevents transient (1-2s) sensor spikes from immediately commanding MAX.
+    Requires persistence >= confirm_sec (default 3.0s / 4.0s) before escalating.
+    Once active, remains in emergency cooling until temperature recovers below
+    recovery_temp (default 80.0°C) to prevent MAX -> idle oscillation.
+    Invalid/missing readings (None, NaN, Inf, <= 0) never clear an active emergency.
+    """
+
+    def __init__(
+        self,
+        threshold: float = AUTO_EMERGENCY_TEMP_THRESHOLD,
+        recovery_temp: float = AUTO_EMERGENCY_RECOVERY_TEMP,
+        confirm_sec: float = AUTO_EMERGENCY_CONFIRMATION_SEC,
+    ) -> None:
+        self.threshold: float = float(threshold)
+        self.recovery_temp: float = float(recovery_temp)
+        self.confirm_sec: float = float(confirm_sec)
+        self.state: str = "normal"
+        self.pending_start: float | None = None
+        self._max_active: bool = False
+
+    @property
+    def max_active(self) -> bool:
+        return self._max_active
+
+    @max_active.setter
+    def max_active(self, val: bool) -> None:
+        self._max_active = bool(val)
+
+    @property
+    def is_max_active(self) -> bool:
+        return self._max_active
+
+    def reset(self) -> None:
+        self.state = "normal"
+        self.pending_start = None
+        self._max_active = False
+
+    def update(
+        self,
+        cpu_temp: float | None,
+        gpu_temp: float | None = None,
+        now: float | None = None,
+    ) -> tuple[str, bool]:
+        cur_time = time.monotonic() if now is None else float(now)
+
+        if (
+            cpu_temp is None
+            or math.isnan(cpu_temp)
+            or math.isinf(cpu_temp)
+            or cpu_temp <= 0
+        ):
+            if self.state == "active":
+                return "active", False
+            return self.state, False
+
+        has_gpu = (
+            gpu_temp is not None
+            and not math.isnan(gpu_temp)
+            and not math.isinf(gpu_temp)
+            and gpu_temp > 0
+        )
+        is_high = (cpu_temp >= self.threshold) or (has_gpu and gpu_temp >= self.threshold)
+
+        if self.state == "normal":
+            if is_high:
+                self.state = "pending"
+                self.pending_start = cur_time
+                return "pending", True
+            return "normal", False
+
+        elif self.state == "pending":
+            if is_high:
+                start = self.pending_start if self.pending_start is not None else cur_time
+                elapsed = cur_time - start
+                if elapsed >= self.confirm_sec:
+                    self.state = "active"
+                    self._max_active = True
+                    return "active", True
+                return "pending", False
+            else:
+                self.state = "normal"
+                self.pending_start = None
+                return "normal", True
+
+        else:  # active
+            recovered = (cpu_temp <= self.recovery_temp) and (not has_gpu or gpu_temp <= self.recovery_temp)
+            if recovered:
+                self.state = "normal"
+                self.pending_start = None
+                self._max_active = False
+                return "normal", True
+            return "active", False
 
 
 class FanController(
@@ -98,9 +210,108 @@ class FanController(
     _consecutive_rpm_shortfall_gpu: int = 0
     _rpm_feedback_trim_cpu: int = 0
     _rpm_feedback_trim_gpu: int = 0
-    _auto_emergency_state: str = "normal"
-    _auto_emergency_pending_start: float | None = None
-    _auto_emergency_max_active: bool = False
+
+    _performance_thermal_state: str = "idle"
+    _performance_consecutive_rpm_shortfall_cpu: int = 0
+    _performance_consecutive_rpm_shortfall_gpu: int = 0
+    _performance_rpm_feedback_trim_cpu: int = 0
+    _performance_rpm_feedback_trim_gpu: int = 0
+
+    @property
+    def _auto_emergency_state(self) -> str:
+        if not hasattr(self, "_auto_emergency_sm"):
+            self._auto_emergency_sm = EmergencySafetyStateMachine()
+        return self._auto_emergency_sm.state
+
+    @_auto_emergency_state.setter
+    def _auto_emergency_state(self, val: str) -> None:
+        if not hasattr(self, "_auto_emergency_sm"):
+            self._auto_emergency_sm = EmergencySafetyStateMachine()
+        self._auto_emergency_sm.state = val
+
+    @property
+    def _auto_emergency_pending_start(self) -> float | None:
+        if not hasattr(self, "_auto_emergency_sm"):
+            self._auto_emergency_sm = EmergencySafetyStateMachine()
+        return self._auto_emergency_sm.pending_start
+
+    @_auto_emergency_pending_start.setter
+    def _auto_emergency_pending_start(self, val: float | None) -> None:
+        if not hasattr(self, "_auto_emergency_sm"):
+            self._auto_emergency_sm = EmergencySafetyStateMachine()
+        self._auto_emergency_sm.pending_start = val
+
+    @property
+    def _auto_emergency_max_active(self) -> bool:
+        if not hasattr(self, "_auto_emergency_sm"):
+            self._auto_emergency_sm = EmergencySafetyStateMachine()
+        return self._auto_emergency_sm.max_active
+
+    @_auto_emergency_max_active.setter
+    def _auto_emergency_max_active(self, val: bool) -> None:
+        if not hasattr(self, "_auto_emergency_sm"):
+            self._auto_emergency_sm = EmergencySafetyStateMachine()
+        self._auto_emergency_sm.max_active = val
+
+    @property
+    def _performance_emergency_state(self) -> str:
+        if not hasattr(self, "_perf_emergency_sm"):
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+                recovery_temp=PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+                confirm_sec=PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+            )
+        return self._perf_emergency_sm.state
+
+    @_performance_emergency_state.setter
+    def _performance_emergency_state(self, val: str) -> None:
+        if not hasattr(self, "_perf_emergency_sm"):
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+                recovery_temp=PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+                confirm_sec=PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+            )
+        self._perf_emergency_sm.state = val
+
+    @property
+    def _performance_emergency_pending_start(self) -> float | None:
+        if not hasattr(self, "_perf_emergency_sm"):
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+                recovery_temp=PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+                confirm_sec=PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+            )
+        return self._perf_emergency_sm.pending_start
+
+    @_performance_emergency_pending_start.setter
+    def _performance_emergency_pending_start(self, val: float | None) -> None:
+        if not hasattr(self, "_perf_emergency_sm"):
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+                recovery_temp=PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+                confirm_sec=PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+            )
+        self._perf_emergency_sm.pending_start = val
+
+    @property
+    def _performance_emergency_max_active(self) -> bool:
+        if not hasattr(self, "_perf_emergency_sm"):
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+                recovery_temp=PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+                confirm_sec=PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+            )
+        return self._perf_emergency_sm.max_active
+
+    @_performance_emergency_max_active.setter
+    def _performance_emergency_max_active(self, val: bool) -> None:
+        if not hasattr(self, "_perf_emergency_sm"):
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=PERFORMANCE_EMERGENCY_TEMP_THRESHOLD,
+                recovery_temp=PERFORMANCE_EMERGENCY_RECOVERY_TEMP,
+                confirm_sec=PERFORMANCE_EMERGENCY_CONFIRMATION_SEC,
+            )
+        self._perf_emergency_sm.max_active = val
 
     def __init__(self, config_path: str | Path | None = None) -> None:
         self._find_paths()
@@ -111,9 +322,21 @@ class FanController(
 
         self.config = self.load_config()
 
-        self._auto_emergency_state = "normal"
-        self._auto_emergency_pending_start = None
-        self._auto_emergency_max_active = False
+        self._auto_emergency_sm = EmergencySafetyStateMachine(
+            threshold=float(self.config.get("auto_emergency_temp_threshold", AUTO_EMERGENCY_TEMP_THRESHOLD)),
+            recovery_temp=float(self.config.get("auto_emergency_recovery_temp", AUTO_EMERGENCY_RECOVERY_TEMP)),
+            confirm_sec=float(self.config.get("auto_emergency_confirmation_sec", AUTO_EMERGENCY_CONFIRMATION_SEC)),
+        )
+        self._perf_emergency_sm = EmergencySafetyStateMachine(
+            threshold=float(self.config.get("performance_emergency_temp_threshold", PERFORMANCE_EMERGENCY_TEMP_THRESHOLD)),
+            recovery_temp=float(self.config.get("performance_emergency_recovery_temp", PERFORMANCE_EMERGENCY_RECOVERY_TEMP)),
+            confirm_sec=float(self.config.get("performance_emergency_confirmation_sec", PERFORMANCE_EMERGENCY_CONFIRMATION_SEC)),
+        )
+        self._performance_thermal_state = "idle"
+        self._performance_consecutive_rpm_shortfall_cpu = 0
+        self._performance_consecutive_rpm_shortfall_gpu = 0
+        self._performance_rpm_feedback_trim_cpu = 0
+        self._performance_rpm_feedback_trim_gpu = 0
         self.reset_auto_stagnation_state()
 
         if self.config.get("cleaner_in_progress", False):
@@ -927,7 +1150,7 @@ class FanController(
                 query_executor=query_executor,
                 force_refresh=True,
             )
-        if self.fan_control_available:
+        if self.get_board_name() != "8CC0" and self.fan_control_available:
             self.set_fan_mode("auto")
 
         return success
@@ -1247,12 +1470,76 @@ class FanController(
 
         return 0
 
+    @staticmethod
+    def calculate_percentile(values: Sequence[float], percentile: float) -> float:
+        """Calculate percentile using linear interpolation between closest ranks.
+
+        Formula:
+          k = (n - 1) * p / 100
+          i = int(k), f = k - i
+          res = s[i] + f * (s[i + 1] - s[i])
+        """
+        if not values:
+            return 0.0
+        sorted_vals = sorted(float(v) for v in values)
+        n = len(sorted_vals)
+        if n == 1:
+            return sorted_vals[0]
+        p = max(0.0, min(100.0, float(percentile)))
+        k = (n - 1) * p / 100.0
+        i = int(k)
+        f = k - i
+        if i >= n - 1:
+            return sorted_vals[-1]
+        return sorted_vals[i] + f * (sorted_vals[i + 1] - sorted_vals[i])
+
+    def get_valid_core_temperatures(self) -> list[float]:
+        """Return list of valid CPU core temperatures, excluding Package id 0."""
+        override = getattr(self, "_core_temps_override", None)
+        if override is not None:
+            raw_temps = override
+        else:
+            raw_temps = []
+            for label, temp in self.get_all_core_temps():
+                if "package" in label.lower():
+                    continue
+                raw_temps.append(temp)
+
+        valid: list[float] = []
+        for x in raw_temps:
+            if x is None:
+                continue
+            try:
+                fx = float(x)
+                if not math.isnan(fx) and not math.isinf(fx) and fx > 0:
+                    valid.append(fx)
+            except (ValueError, TypeError):
+                continue
+        return valid
+
+    def get_cpu_normal_temp(self) -> float | None:
+        """Authoritative normal CPU temperature: 75th percentile of valid cores."""
+        cores = self.get_valid_core_temperatures()
+        if cores:
+            return self.calculate_percentile(cores, 75.0)
+        return None
+
+    def get_cpu_emergency_temp(self) -> float | None:
+        """Authoritative emergency CPU temperature: maximum of valid cores."""
+        cores = self.get_valid_core_temperatures()
+        if cores:
+            return float(max(cores))
+        return None
+
     def get_reference_temp(self) -> int:
         sensor = self.config.get("reference_sensor", "cpu")
         if sensor == "gpu":
             gpu_temp = self.get_gpu_temp()
             if gpu_temp > 0:
                 return gpu_temp
+        normal_cpu = self.get_cpu_normal_temp()
+        if normal_cpu is not None and normal_cpu > 0:
+            return int(round(normal_cpu))
         return self.get_cpu_temp()
 
     def get_all_core_temps(self) -> list[tuple[str, int]]:
@@ -1336,6 +1623,10 @@ class FanController(
         """True if the RPM sysfs input file for the specified fan exists, is supported,
         and has not encountered a read error.
         """
+        if self.get_board_name() == "8CC0":
+            if self.is_experimental_telemetry_enabled():
+                return EXPERIMENTAL_FAN_TELEMETRY_PATH.exists()
+            return False
         if self._is_unsupported_telemetry_board():
             return False
         if not self.hwmon_path or (hasattr(self.hwmon_path, "exists") and not self.hwmon_path.exists()):
@@ -1353,6 +1644,13 @@ class FanController(
         return self.is_fan_telemetry_available(1) or self.is_fan_telemetry_available(2)
 
     def set_fan_mode(self, mode: str) -> None:
+        if self.get_board_name() == "8CC0" and self.is_experimental_control_enabled():
+            if mode == "max":
+                self.set_experimental_fan_max(True)
+            elif mode == "auto":
+                self.restore_firmware_auto()
+            return
+
         if not self.fan_control_available:
             return
         if mode == "max":
@@ -1816,15 +2114,23 @@ class FanController(
             "emergency_state": self.get_auto_emergency_state(),
         }
 
+    def _ensure_auto_emergency_sm(self) -> None:
+        if not hasattr(self, "_auto_emergency_sm") or self._auto_emergency_sm is None:
+            self._auto_emergency_sm = EmergencySafetyStateMachine(
+                threshold=float(self.config.get("auto_emergency_temp_threshold", AUTO_EMERGENCY_TEMP_THRESHOLD)),
+                recovery_temp=float(self.config.get("auto_emergency_recovery_temp", AUTO_EMERGENCY_RECOVERY_TEMP)),
+                confirm_sec=float(self.config.get("auto_emergency_confirmation_sec", AUTO_EMERGENCY_CONFIRMATION_SEC)),
+            )
+
     def get_auto_emergency_state(self) -> str:
         """Return current AUTO emergency cooling state: 'normal', 'pending', or 'active'."""
-        return getattr(self, "_auto_emergency_state", "normal")
+        self._ensure_auto_emergency_sm()
+        return self._auto_emergency_sm.state
 
     def reset_auto_emergency_state(self) -> None:
         """Reset AUTO emergency cooling state machine."""
-        self._auto_emergency_state = "normal"
-        self._auto_emergency_pending_start = None
-        self._auto_emergency_max_active = False
+        self._ensure_auto_emergency_sm()
+        self._auto_emergency_sm.reset()
 
     def update_auto_emergency_state(
         self,
@@ -1832,68 +2138,18 @@ class FanController(
         gpu_temp: float | None = None,
         now: float | None = None,
     ) -> tuple[str, bool]:
-        """Evaluate high-temperature spike barrier and emergency MAX cooling.
-
-        Prevents transient (1-2s) sensor spikes from immediately commanding MAX.
-        Requires persistence >= confirmation_sec (default 3.0s) before escalating.
-        Once active, remains in emergency cooling until temperature recovers below
-        recovery_temp (default 80.0°C) to prevent MAX -> idle oscillation.
-
-        Returns (new_emergency_state, state_changed).
-        """
-        current_state = self.get_auto_emergency_state()
-        cur_time = time.monotonic() if now is None else float(now)
-
-        # Handle sensor robustness: invalid / missing readings must never be interpreted
-        # as proof that temperatures are safe when in emergency cooling.
-        if (
-            cpu_temp is None
-            or math.isnan(cpu_temp)
-            or math.isinf(cpu_temp)
-            or cpu_temp <= 0
-        ):
-            if current_state == "active":
-                return "active", False
-            return current_state, False
-
-        threshold = float(self.config.get("auto_emergency_temp_threshold", AUTO_EMERGENCY_TEMP_THRESHOLD))
-        recovery_temp = float(self.config.get("auto_emergency_recovery_temp", AUTO_EMERGENCY_RECOVERY_TEMP))
-        confirm_sec = float(self.config.get("auto_emergency_confirmation_sec", AUTO_EMERGENCY_CONFIRMATION_SEC))
-
-        has_gpu = (gpu_temp is not None and not math.isnan(gpu_temp) and not math.isinf(gpu_temp) and gpu_temp > 0)
-        is_high = (cpu_temp >= threshold) or (has_gpu and gpu_temp >= threshold)
-
-        if current_state == "normal":
-            if is_high:
-                self._auto_emergency_state = "pending"
-                self._auto_emergency_pending_start = cur_time
-                return "pending", True
-            return "normal", False
-
-        elif current_state == "pending":
-            if is_high:
-                start = self._auto_emergency_pending_start if self._auto_emergency_pending_start is not None else cur_time
-                elapsed = cur_time - start
-                if elapsed >= confirm_sec:
-                    self._auto_emergency_state = "active"
-                    self._auto_emergency_max_active = True
-                    return "active", True
-                return "pending", False
-            else:
-                # Transient spike cleared before confirmation period!
-                self._auto_emergency_state = "normal"
-                self._auto_emergency_pending_start = None
-                return "normal", True
-
-        else:  # active
-            # Recovery requires temperatures to fall below recovery threshold
-            recovered = (cpu_temp <= recovery_temp) and (not has_gpu or gpu_temp <= recovery_temp)
-            if recovered:
-                self._auto_emergency_state = "normal"
-                self._auto_emergency_pending_start = None
-                self._auto_emergency_max_active = False
-                return "normal", True
-            return "active", False
+        """Evaluate high-temperature spike barrier and emergency MAX cooling for AUTO mode."""
+        self._ensure_auto_emergency_sm()
+        self._auto_emergency_sm.threshold = float(
+            self.config.get("auto_emergency_temp_threshold", AUTO_EMERGENCY_TEMP_THRESHOLD)
+        )
+        self._auto_emergency_sm.recovery_temp = float(
+            self.config.get("auto_emergency_recovery_temp", AUTO_EMERGENCY_RECOVERY_TEMP)
+        )
+        self._auto_emergency_sm.confirm_sec = float(
+            self.config.get("auto_emergency_confirmation_sec", AUTO_EMERGENCY_CONFIRMATION_SEC)
+        )
+        return self._auto_emergency_sm.update(cpu_temp, gpu_temp, now)
 
     def get_auto_stagnation_boost(self) -> tuple[int, int]:
         """Return current (cpu_boost, gpu_boost) fan levels."""
@@ -2081,6 +2337,298 @@ class FanController(
         self._rpm_feedback_trim_gpu = 0
         self.reset_auto_emergency_state()
         self.reset_auto_stagnation_state()
+
+    # --------------------------------------------------------------------------
+    # PERFORMANCE Mode (8CC0 Software Dual-Fan Speed Control)
+    # --------------------------------------------------------------------------
+
+    def get_performance_curve_breakpoints(self) -> tuple[dict[str, Any], ...]:
+        """Return the explicit 5°C thermal breakpoints table for PERFORMANCE mode."""
+        return PERFORMANCE_BREAKPOINTS_TABLE
+
+    def interpolate_performance_curve(self, temp: float) -> tuple[int, int, str]:
+        """Linearly interpolate CPU and GPU target RPMs between explicit breakpoints.
+
+        Table:
+          55°C: 2000 / 2000 RPM (DEFINED)
+          60°C: 2500 / 2600 RPM (DEFINED)
+          65°C: 3200 / 3400 RPM (DEFINED)
+          70°C: 4000 / 4200 RPM (DEFINED)
+          75°C: 4800 / 5100 RPM (DEFINED)
+          80°C: 5400 / 5700 RPM (DEFINED)
+          85°C: 5700 / 6100 RPM (OBSERVED-CEILING)
+
+        Below 55°C clamps to (2000, 2000, '< 55°C').
+        Above 85°C clamps to (5700, 6100, '> 85°C').
+        """
+        table = self.get_performance_curve_breakpoints()
+        t = float(temp)
+        if t <= table[0]["temp"]:
+            interval = f"< {int(table[0]['temp'])}°C" if t < table[0]["temp"] else f"{int(table[0]['temp'])}°C"
+            return table[0]["cpu_rpm"], table[0]["gpu_rpm"], interval
+
+        if t >= table[-1]["temp"]:
+            interval = f"> {int(table[-1]['temp'])}°C" if t > table[-1]["temp"] else f"{int(table[-1]['temp'])}°C"
+            return table[-1]["cpu_rpm"], table[-1]["gpu_rpm"], interval
+
+        for i in range(len(table) - 1):
+            bp1 = table[i]
+            bp2 = table[i + 1]
+            if bp1["temp"] <= t <= bp2["temp"]:
+                if t == bp1["temp"]:
+                    return bp1["cpu_rpm"], bp1["gpu_rpm"], f"{int(bp1['temp'])}°C"
+                if t == bp2["temp"]:
+                    return bp2["cpu_rpm"], bp2["gpu_rpm"], f"{int(bp2['temp'])}°C"
+                ratio = (t - bp1["temp"]) / (bp2["temp"] - bp1["temp"])
+                cpu_rpm = int(round(bp1["cpu_rpm"] + ratio * (bp2["cpu_rpm"] - bp1["cpu_rpm"])))
+                gpu_rpm = int(round(bp1["gpu_rpm"] + ratio * (bp2["gpu_rpm"] - bp1["gpu_rpm"])))
+                interval = f"{int(bp1['temp'])}°C–{int(bp2['temp'])}°C"
+                return cpu_rpm, gpu_rpm, interval
+
+        return table[-1]["cpu_rpm"], table[-1]["gpu_rpm"], f"{int(table[-1]['temp'])}°C"
+
+    def get_performance_thermal_state(self) -> str:
+        """Return current PERFORMANCE thermal state: 'idle' or 'active'."""
+        return getattr(self, "_performance_thermal_state", "idle")
+
+    def update_performance_thermal_state(
+        self,
+        cpu_temp: float,
+        gpu_temp: float | None = None,
+    ) -> tuple[str, bool]:
+        """Update PERFORMANCE mode thermal state machine using dual-domain hysteresis.
+
+        Activation:
+          CPU >= 55.0°C OR GPU >= 45.0°C (transitions idle -> active)
+        Cooldown:
+          CPU <= 50.0°C AND (GPU <= 40.0°C or GPU is None/unavailable) (transitions active -> idle)
+        Hysteresis:
+          5.0°C on both CPU and GPU boundaries.
+        Returns (new_state, state_changed).
+        """
+        current_state = self.get_performance_thermal_state()
+        has_gpu = (gpu_temp is not None and not math.isnan(gpu_temp) and not math.isinf(gpu_temp) and gpu_temp > 0)
+
+        is_hot = (cpu_temp >= PERFORMANCE_ACTIVATION_CPU_TEMP) or (has_gpu and gpu_temp >= PERFORMANCE_ACTIVATION_GPU_TEMP)
+        is_cool = (cpu_temp <= PERFORMANCE_COOLDOWN_CPU_TEMP) and (not has_gpu or gpu_temp <= PERFORMANCE_COOLDOWN_GPU_TEMP)
+
+        if current_state == "idle":
+            if is_hot:
+                self._performance_thermal_state = "active"
+                return "active", True
+            return "idle", False
+        else:  # active
+            if is_cool:
+                self._performance_thermal_state = "idle"
+                return "idle", True
+            return "active", False
+
+    def calculate_performance_target(
+        self,
+        cpu_temp: float,
+        gpu_temp: float | None = None,
+        independent_fans: bool = False,
+    ) -> dict[str, Any]:
+        """Calculate target RPMs, fan levels, and active intervals for PERFORMANCE mode.
+
+        Returns dictionary reporting:
+          - current_temp: effective temperature
+          - active_interval: string describing breakpoint interval
+          - target_cpu_rpm: target CPU fan speed
+          - target_gpu_rpm: target GPU fan speed
+          - cpu_fan_level: commanded 0x2E CPU level (with active floor applied)
+          - gpu_fan_level: commanded 0x2E GPU level (with active floor applied)
+          - actual_cpu_rpm: measured 0x2D CPU RPM if telemetry available
+          - actual_gpu_rpm: measured 0x2D GPU RPM if telemetry available
+          - thermal_state: 'idle' or 'active'
+          - emergency_state: 'normal', 'pending', or 'active'
+        """
+        state = self.get_performance_thermal_state()
+        has_gpu = (gpu_temp is not None and gpu_temp > 0)
+
+        gpu_normalized = (gpu_temp + (PERFORMANCE_ACTIVATION_CPU_TEMP - PERFORMANCE_ACTIVATION_GPU_TEMP)) if has_gpu else 0.0
+        effective_temp = max(float(cpu_temp), gpu_normalized)
+
+        if independent_fans and has_gpu:
+            target_cpu_rpm, _, interval_cpu = self.interpolate_performance_curve(float(cpu_temp))
+            _, target_gpu_rpm, interval_gpu = self.interpolate_performance_curve(gpu_normalized)
+            interval = f"CPU:{interval_cpu} GPU:{interval_gpu}"
+        else:
+            target_cpu_rpm, target_gpu_rpm, interval = self.interpolate_performance_curve(effective_temp)
+
+        if state == "idle":
+            target_cpu_rpm = 0
+            target_gpu_rpm = 0
+            cpu_level = FIRMWARE_AUTO_FAN_LEVEL
+            gpu_level = FIRMWARE_AUTO_FAN_LEVEL
+        else:
+            raw_cpu_level = self.rpm_to_fan_level(target_cpu_rpm)
+            raw_gpu_level = self.rpm_to_fan_level(target_gpu_rpm)
+            cpu_floor, gpu_floor = self.get_calibrated_min_fan_levels()
+            active_cpu_floor = max(cpu_floor, ACTIVE_PERFORMANCE_MIN_FAN_LEVEL)
+            active_gpu_floor = max(gpu_floor, ACTIVE_PERFORMANCE_MIN_FAN_LEVEL)
+            cpu_level = self.clamp_software_auto_fan_level(raw_cpu_level, min_floor=active_cpu_floor)
+            gpu_level = self.clamp_software_auto_fan_level(raw_gpu_level, min_floor=active_gpu_floor)
+
+            cpu_ceiling = int(self.config.get("performance_max_fan_level_cpu", PERFORMANCE_MAX_FAN_LEVEL_CPU))
+            gpu_ceiling = int(self.config.get("performance_max_fan_level_gpu", PERFORMANCE_MAX_FAN_LEVEL_GPU))
+            cpu_level = min(cpu_ceiling, cpu_level)
+            gpu_level = min(gpu_ceiling, gpu_level)
+
+        actual_cpu_rpm = None
+        actual_gpu_rpm = None
+        if self.is_experimental_telemetry_enabled():
+            telemetry = self.read_experimental_fan_telemetry()
+            if telemetry is not None:
+                actual_cpu_rpm, actual_gpu_rpm = telemetry
+
+        return {
+            "current_temp": effective_temp,
+            "active_interval": interval,
+            "target_cpu_rpm": target_cpu_rpm,
+            "target_gpu_rpm": target_gpu_rpm,
+            "cpu_fan_level": cpu_level,
+            "gpu_fan_level": gpu_level,
+            "actual_cpu_rpm": actual_cpu_rpm,
+            "actual_gpu_rpm": actual_gpu_rpm,
+            "thermal_state": state,
+            "emergency_state": self.get_performance_emergency_state(),
+        }
+
+    def _ensure_perf_emergency_sm(self) -> None:
+        if not hasattr(self, "_perf_emergency_sm") or self._perf_emergency_sm is None:
+            self._perf_emergency_sm = EmergencySafetyStateMachine(
+                threshold=float(self.config.get("performance_emergency_temp_threshold", PERFORMANCE_EMERGENCY_TEMP_THRESHOLD)),
+                recovery_temp=float(self.config.get("performance_emergency_recovery_temp", PERFORMANCE_EMERGENCY_RECOVERY_TEMP)),
+                confirm_sec=float(self.config.get("performance_emergency_confirmation_sec", PERFORMANCE_EMERGENCY_CONFIRMATION_SEC)),
+            )
+
+    def get_performance_emergency_state(self) -> str:
+        """Return current PERFORMANCE emergency cooling state: 'normal', 'pending', or 'active'."""
+        self._ensure_perf_emergency_sm()
+        return self._perf_emergency_sm.state
+
+    def reset_performance_emergency_state(self) -> None:
+        """Reset PERFORMANCE emergency cooling state machine."""
+        self._ensure_perf_emergency_sm()
+        self._perf_emergency_sm.reset()
+
+    def update_performance_emergency_state(
+        self,
+        cpu_temp: float | None,
+        gpu_temp: float | None = None,
+        now: float | None = None,
+    ) -> tuple[str, bool]:
+        """Evaluate high-temperature spike barrier for PERFORMANCE mode."""
+        self._ensure_perf_emergency_sm()
+        self._perf_emergency_sm.threshold = float(
+            self.config.get("performance_emergency_temp_threshold", PERFORMANCE_EMERGENCY_TEMP_THRESHOLD)
+        )
+        self._perf_emergency_sm.recovery_temp = float(
+            self.config.get("performance_emergency_recovery_temp", PERFORMANCE_EMERGENCY_RECOVERY_TEMP)
+        )
+        self._perf_emergency_sm.confirm_sec = float(
+            self.config.get("performance_emergency_confirmation_sec", PERFORMANCE_EMERGENCY_CONFIRMATION_SEC)
+        )
+        return self._perf_emergency_sm.update(cpu_temp, gpu_temp, now)
+
+    def apply_performance_rpm_feedback(
+        self,
+        actual_cpu_rpm: int,
+        actual_gpu_rpm: int,
+        target_cpu_rpm: int,
+        target_gpu_rpm: int,
+        lag_threshold: int = 350,
+    ) -> tuple[int, int]:
+        """Track RPM deviations against target RPM for PERFORMANCE mode and conservatively compensate.
+        Returns (trim_cpu, trim_gpu).
+        """
+        if actual_cpu_rpm < target_cpu_rpm - lag_threshold and target_cpu_rpm > 0:
+            self._performance_consecutive_rpm_shortfall_cpu += 1
+            if self._performance_consecutive_rpm_shortfall_cpu >= 2:
+                self._performance_rpm_feedback_trim_cpu = min(3, self._performance_rpm_feedback_trim_cpu + 1)
+                self._performance_consecutive_rpm_shortfall_cpu = 0
+        elif actual_cpu_rpm >= target_cpu_rpm - 200:
+            self._performance_consecutive_rpm_shortfall_cpu = 0
+            self._performance_rpm_feedback_trim_cpu = max(0, self._performance_rpm_feedback_trim_cpu - 1)
+
+        if actual_gpu_rpm < target_gpu_rpm - lag_threshold and target_gpu_rpm > 0:
+            self._performance_consecutive_rpm_shortfall_gpu += 1
+            if self._performance_consecutive_rpm_shortfall_gpu >= 2:
+                self._performance_rpm_feedback_trim_gpu = min(3, self._performance_rpm_feedback_trim_gpu + 1)
+                self._performance_consecutive_rpm_shortfall_gpu = 0
+        elif actual_gpu_rpm >= target_gpu_rpm - 200:
+            self._performance_consecutive_rpm_shortfall_gpu = 0
+            self._performance_rpm_feedback_trim_gpu = max(0, self._performance_rpm_feedback_trim_gpu - 1)
+
+        return self._performance_rpm_feedback_trim_cpu, self._performance_rpm_feedback_trim_gpu
+
+    def reset_performance_state(self) -> None:
+        """Reset internal PERFORMANCE mode state machine, feedback counters, and emergency state."""
+        self._performance_thermal_state = "idle"
+        self._performance_consecutive_rpm_shortfall_cpu = 0
+        self._performance_consecutive_rpm_shortfall_gpu = 0
+        self._performance_rpm_feedback_trim_cpu = 0
+        self._performance_rpm_feedback_trim_gpu = 0
+        self.reset_performance_emergency_state()
+
+    def transition_mode(self, from_mode: str, to_mode: str) -> None:
+        """Coherent transition between operational modes without restarting process.
+
+        Exits outgoing mode, resets transient state, releases hardware ownership if required,
+        and initializes destination mode.
+        """
+        f = (from_mode or "").lower()
+        t = (to_mode or "").lower()
+        if f == t:
+            return
+
+        # 1. Exit outgoing mode and release previous hardware ownership
+        if f == "max":
+            if self.get_board_name() == "8CC0" and self.is_experimental_control_enabled():
+                self.set_experimental_fan_max(False)
+            self._cancel_experimental_max_keepalive()
+        elif f == "auto":
+            self.reset_auto_state()
+        elif f == "performance":
+            self.reset_performance_state()
+
+        # 2. Enter destination mode and establish hardware ownership
+        if t == "max":
+            self.reset_auto_emergency_state()
+            self.reset_performance_emergency_state()
+            if self.get_board_name() == "8CC0" and self.is_experimental_control_enabled():
+                self.set_experimental_fan_max(True)
+            else:
+                self.set_fan_mode("max")
+        elif t == "auto":
+            self.reset_auto_state()
+        elif t == "performance":
+            self.reset_performance_state()
+
+    def handle_resume(self) -> None:
+        """Revalidate sysfs interfaces and safely restore active mode on system resume."""
+        self._find_paths()
+        self._last_control_time = 0.0
+        self.reset_runtime_min_fan_floors()
+        self.reset_auto_emergency_state()
+        self.reset_performance_emergency_state()
+        self.reset_auto_stagnation_state()
+        mode = self.config.get("mode", "auto")
+        if mode == "max":
+            if self.get_board_name() == "8CC0" and self.is_experimental_control_enabled():
+                self.set_experimental_fan_max(True)
+            else:
+                self.set_fan_mode("max")
+        elif mode in ("auto", "performance"):
+            self.restore_firmware_auto()
+
+    def handle_suspend(self) -> None:
+        """Safely release hardware to firmware control before system suspend."""
+        try:
+            self.restore_firmware_auto()
+        except Exception:
+            pass
 
     def calibrate(self) -> Generator[int, None, tuple[int, int]]:
         if not self.fan_control_available:
